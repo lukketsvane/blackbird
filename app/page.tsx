@@ -605,8 +605,7 @@ export default function BlackbirdConverter() {
       <p className="mt-6 text-sm text-muted-foreground font-medium">
         {state === "idle" && "tap to record"}
         {state === "recording" && "recording"}
-        {state === "processing" && (mode === "decode" ? "decoding" : "encoding")}
-        {state === "uploading" && "uploading"}
+        {(state === "processing" || state === "uploading") && (mode === "decode" ? "decoding" : "encoding")}
         {state === "playing" && (mode === "decode" ? "voice" : "birdsong")}
       </p>
 
