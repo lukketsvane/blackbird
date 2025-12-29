@@ -610,13 +610,6 @@ export default function BlackbirdConverter() {
         {state === "playing" && (mode === "decode" ? "voice" : "birdsong")}
       </p>
 
-      {/* URL Display */}
-      {blobUrl && state === "idle" && (
-        <p className="mt-2 text-xs text-muted-foreground/70 max-w-xs truncate px-4 text-center">
-          {blobUrl}
-        </p>
-      )}
-
       {/* Footer */}
       <div className="absolute bottom-6 text-center safe-bottom">
         <p className="text-xs text-muted-foreground">
