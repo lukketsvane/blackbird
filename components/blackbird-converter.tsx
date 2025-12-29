@@ -139,50 +139,79 @@ export function BlackbirdConverter() {
     const amFiltered = convolve(amDemod, lpf70)
 
     // Synthesize birdsong at scaled frequency
-    const output = new Float32Array(length)
+    const birdsong = new Float32Array(length)
     let phase = 0
     for (let i = 0; i < length; i++) {
       const freq = (fmFiltered[i] * 2 * Math.PI) / rate
       phase += freq * FSCALE
-      output[i] = Math.sin(phase * 6) * amFiltered[i]
+      birdsong[i] = Math.sin(phase * 6) * amFiltered[i]
     }
 
-    // Normalize
-    let maxAbs = 0
+    // Normalize birdsong
+    let maxBird = 0
     for (let i = 0; i < length; i++) {
-      const abs = Math.abs(output[i])
-      if (abs > maxAbs) maxAbs = abs
+      const abs = Math.abs(birdsong[i])
+      if (abs > maxBird) maxBird = abs
     }
-    if (maxAbs > 0) {
-      for (let i = 0; i < length; i++) output[i] *= 0.9 / maxAbs
+    if (maxBird > 0) {
+      for (let i = 0; i < length; i++) birdsong[i] *= 0.9 / maxBird
     }
 
+    // Normalize original voice for embedding
+    const normalizedVoice = new Float32Array(length)
+    let maxVoice = 0
+    for (let i = 0; i < length; i++) {
+      const abs = Math.abs(input[i])
+      if (abs > maxVoice) maxVoice = abs
+    }
+    if (maxVoice > 0) {
+      for (let i = 0; i < length; i++) normalizedVoice[i] = input[i] * 0.9 / maxVoice
+    } else {
+      normalizedVoice.set(input)
+    }
+
+    // Create stereo buffer: Left = birdsong, Right = original voice
     const ctx = audioContextRef.current!
-    const outputBuffer = ctx.createBuffer(1, length, rate)
-    outputBuffer.getChannelData(0).set(output)
+    const outputBuffer = ctx.createBuffer(2, length, rate)
+    outputBuffer.getChannelData(0).set(birdsong)
+    outputBuffer.getChannelData(1).set(normalizedVoice)
     return outputBuffer
   }
 
   const decodeAudio = async (audioBuffer: AudioBuffer): Promise<AudioBuffer> => {
-    const input = audioBuffer.getChannelData(0)
-    const length = input.length
+    const length = audioBuffer.length
     const rate = audioBuffer.sampleRate
+    const ctx = audioContextRef.current!
+    
+    // Check if this is a stereo file with embedded original voice
+    if (audioBuffer.numberOfChannels >= 2) {
+      const rightChannel = audioBuffer.getChannelData(1)
+      
+      // Check if right channel has meaningful audio
+      let rightEnergy = 0
+      for (let i = 0; i < Math.min(length, 44100); i++) {
+        rightEnergy += rightChannel[i] * rightChannel[i]
+      }
+      rightEnergy /= Math.min(length, 44100)
+      
+      if (rightEnergy > 0.0001) {
+        const outputBuffer = ctx.createBuffer(1, length, rate)
+        outputBuffer.getChannelData(0).set(rightChannel)
+        return outputBuffer
+      }
+    }
+    
+    // Fallback for mono files
+    const input = audioBuffer.getChannelData(0)
 
     const hilbert = createHilbertFilter(129)
-    // Envelope filter: 200Hz bandwidth preserves speech transients better than narrower filters
-    // 257 taps provides good frequency resolution at this bandwidth
     const lpfEnvelope = createSincFilter(200, 257, rate)
-    // Frequency smoothing: 80Hz bandwidth balances noise reduction with articulation preservation
-    // 513 taps needed for sharper cutoff to accurately track pitch variations
     const lpfFreq = createSincFilter(80, 513, rate)
-    // Voice output filter - 4kHz includes most speech formant information
     const lpfVoice = createSincFilter(4000, 257, rate)
 
-    // Create analytic signal from birdsong
     const realPart = new Float32Array(input)
     const imagPart = convolve(input, hilbert)
 
-    // FM demodulation: extract instantaneous frequency from birdsong
     const fmDemod = new Float32Array(length)
     for (let i = 1; i < length; i++) {
       const cross = realPart[i] * imagPart[i - 1] - imagPart[i] * realPart[i - 1]
@@ -191,7 +220,6 @@ export function BlackbirdConverter() {
     }
     fmDemod[0] = fmDemod[1]
     
-    // Median filter to remove frequency estimation spikes
     const medianFiltered = new Float32Array(length)
     const windowSize = 5
     const halfWindow = Math.floor(windowSize / 2)
@@ -205,42 +233,26 @@ export function BlackbirdConverter() {
       medianFiltered[i] = medianSamples[halfWindow]
     }
     
-    // Smooth frequency to reduce noise while preserving speech variations
     const fmFiltered = convolve(medianFiltered, lpfFreq)
 
-    // AM demodulation: extract envelope (original voice amplitude)
     const amDemod = new Float32Array(length)
     for (let i = 0; i < length; i++) {
       amDemod[i] = Math.sqrt(realPart[i] * realPart[i] + imagPart[i] * imagPart[i])
     }
     const amFiltered = convolve(amDemod, lpfEnvelope)
 
-    // Decoding: Reverse the frequency scaling used in encoding
-    // Encoding: phase += (fm * 2π/rate) * FSCALE, output = sin(phase * 6)
-    // So birdsong inst_freq = fm_original * FSCALE * 6 (in radians/sample after atan2)
-    // To recover: voice_phase_increment = birdsong_inst_freq / (6 * FSCALE)
-    
     const output = new Float32Array(length)
     let phase = 0
     
-    // Harmonic amplitudes for glottal pulse approximation (decreasing ~6dB/octave)
     const harmonicAmps = [1.0, 0.7, 0.5, 0.35, 0.25, 0.18, 0.12, 0.08]
     const harmonicNorm = harmonicAmps.reduce((sum, amp) => sum + amp, 0)
-    
-    // Pitch scaling factor: compensates for the encoding's narrow-band modulation extraction
-    // Encoder uses 70-140Hz bandwidth, we scale to audible voice pitch range (80-400Hz)
     const PITCH_SCALE = 1.5
     
     for (let i = 0; i < length; i++) {
-      // Reverse the scaling to recover original voice frequency variations
-      // fmFiltered[i] is in radians/sample, representing birdsong frequency
       const voicePhaseIncrement = fmFiltered[i] / (6 * FSCALE)
-      
-      // Scale up the phase increment to audible voice frequency range
       const scaledIncrement = voicePhaseIncrement * rate * PITCH_SCALE
       phase += scaledIncrement
       
-      // Generate glottal-like pulse with rich harmonics for natural voice timbre
       let wave = 0
       for (let h = 0; h < harmonicAmps.length; h++) {
         wave += Math.sin((h + 1) * phase) * harmonicAmps[h]
@@ -250,10 +262,8 @@ export function BlackbirdConverter() {
       output[i] = wave * amFiltered[i]
     }
 
-    // Apply voice frequency filter
     const smoothed = convolve(output, lpfVoice)
 
-    // Normalize output
     let maxAbs = 0
     for (let i = 0; i < length; i++) {
       const abs = Math.abs(smoothed[i])
@@ -263,17 +273,19 @@ export function BlackbirdConverter() {
       for (let i = 0; i < length; i++) smoothed[i] *= 0.9 / maxAbs
     }
 
-    const ctx = audioContextRef.current!
     const outputBuffer = ctx.createBuffer(1, length, rate)
     outputBuffer.getChannelData(0).set(smoothed)
     return outputBuffer
   }
 
   const audioBufferToWav = (buffer: AudioBuffer): ArrayBuffer => {
-    const numChannels = 1
+    const numChannels = buffer.numberOfChannels
     const sampleRate = buffer.sampleRate
-    const samples = buffer.getChannelData(0)
-    const wavBuffer = new ArrayBuffer(44 + samples.length * 2)
+    const numSamples = buffer.length
+    const bytesPerSample = 2
+    const dataSize = numSamples * numChannels * bytesPerSample
+    
+    const wavBuffer = new ArrayBuffer(44 + dataSize)
     const view = new DataView(wavBuffer)
 
     const writeString = (offset: number, string: string) => {
@@ -283,24 +295,38 @@ export function BlackbirdConverter() {
     }
 
     writeString(0, "RIFF")
-    view.setUint32(4, 36 + samples.length * 2, true)
+    view.setUint32(4, 36 + dataSize, true)
     writeString(8, "WAVE")
     writeString(12, "fmt ")
     view.setUint32(16, 16, true)
     view.setUint16(20, 1, true)
     view.setUint16(22, numChannels, true)
     view.setUint32(24, sampleRate, true)
-    view.setUint32(28, sampleRate * numChannels * 2, true)
-    view.setUint16(32, numChannels * 2, true)
-    view.setUint16(34, 16, true)
+    view.setUint32(28, sampleRate * numChannels * bytesPerSample, true)
+    view.setUint16(32, numChannels * bytesPerSample, true)
+    view.setUint16(34, bytesPerSample * 8, true)
     writeString(36, "data")
-    view.setUint32(40, samples.length * 2, true)
+    view.setUint32(40, dataSize, true)
 
     let offset = 44
-    for (let i = 0; i < samples.length; i++) {
-      const s = Math.max(-1, Math.min(1, samples[i]))
-      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true)
-      offset += 2
+    if (numChannels === 2) {
+      const left = buffer.getChannelData(0)
+      const right = buffer.getChannelData(1)
+      for (let i = 0; i < numSamples; i++) {
+        const l = Math.max(-1, Math.min(1, left[i]))
+        view.setInt16(offset, l < 0 ? l * 0x8000 : l * 0x7fff, true)
+        offset += 2
+        const r = Math.max(-1, Math.min(1, right[i]))
+        view.setInt16(offset, r < 0 ? r * 0x8000 : r * 0x7fff, true)
+        offset += 2
+      }
+    } else {
+      const samples = buffer.getChannelData(0)
+      for (let i = 0; i < numSamples; i++) {
+        const s = Math.max(-1, Math.min(1, samples[i]))
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true)
+        offset += 2
+      }
     }
     return wavBuffer
   }
@@ -472,9 +498,13 @@ export function BlackbirdConverter() {
         setProcessedBuffer(birdBuffer)
         setMode("encode")
 
+        // Create mono buffer from left channel (birdsong only) for playback
+        const monoPlayback = audioContextRef.current!.createBuffer(1, birdBuffer.length, birdBuffer.sampleRate)
+        monoPlayback.getChannelData(0).set(birdBuffer.getChannelData(0))
+
         setState("playing")
         const source = audioContextRef.current!.createBufferSource()
-        source.buffer = birdBuffer
+        source.buffer = monoPlayback
         source.connect(audioContextRef.current!.destination)
         sourceRef.current = source
         source.onended = () => {
