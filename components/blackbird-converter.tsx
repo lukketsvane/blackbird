@@ -27,6 +27,9 @@ export function BlackbirdConverter() {
   const SAMPLE_RATE = 44100
   const FSCALE = 24000
   const SHIFT_FREQ = -0.005
+  // Harmonic coefficients for voice-like waveform synthesis during decoding
+  const VOICE_HARMONICS = { h1: 1, h2: 0.5, h3: 0.4, h4: 0.25, h5: 0.15 }
+  const VOICE_HARMONIC_NORM = 2.3 // Sum of coefficients for normalization
 
   const createHilbertFilter = (length: number): Float32Array => {
     const filter = new Float32Array(length)
@@ -169,47 +172,58 @@ export function BlackbirdConverter() {
     const rate = audioBuffer.sampleRate
 
     const hilbert = createHilbertFilter(129)
-    // Higher cutoff for birdsong frequencies
-    const lpfHigh = createSincFilter(4000, 1025, rate)
-    const lpfLow = createSincFilter(200, 1025, rate)
+    // Envelope smoothing filter (same as encoding)
+    const lpfEnvelope = createSincFilter(70, 1025, rate)
+    // Voice output filter
+    const lpfVoice = createSincFilter(4000, 257, rate)
 
     // Create analytic signal from birdsong
     const realPart = new Float32Array(input)
     const imagPart = convolve(input, hilbert)
 
-    // FM demodulation to extract pitch contour from birdsong
+    // FM demodulation: extract instantaneous frequency from birdsong
+    // The birdsong frequency encodes the original voice pitch scaled up
     const fmDemod = new Float32Array(length)
     for (let i = 1; i < length; i++) {
       const cross = realPart[i] * imagPart[i - 1] - imagPart[i] * realPart[i - 1]
       const dot = realPart[i] * realPart[i - 1] + imagPart[i] * imagPart[i - 1]
       fmDemod[i] = Math.atan2(cross, dot)
     }
-    const fmFiltered = convolve(fmDemod, lpfHigh)
 
-    // AM demodulation for envelope
+    // AM demodulation: extract envelope (this is the original voice envelope)
     const amDemod = new Float32Array(length)
     for (let i = 0; i < length; i++) {
       amDemod[i] = Math.sqrt(realPart[i] * realPart[i] + imagPart[i] * imagPart[i])
     }
-    const amFiltered = convolve(amDemod, lpfLow)
+    const amFiltered = convolve(amDemod, lpfEnvelope)
 
-    // Synthesize voice at SCALED DOWN frequency (divide by FSCALE instead of multiply)
+    // Decoding: Reverse the frequency scaling used in encoding
+    // Encoding used: phase += (fm * 2π/rate) * FSCALE, output = sin(phase * 6)
+    // So birdsong phase increment = 6 * FSCALE * original_fm
+    // To recover voice, divide by (6 * FSCALE)
+    
     const output = new Float32Array(length)
     let phase = 0
+    
     for (let i = 0; i < length; i++) {
-      // Scale frequency DOWN by FSCALE to get back to voice range
-      const freq = (fmFiltered[i] * 2 * Math.PI) / rate
-      phase += freq / 6 // Reverse the *6 harmonic
-      // Use sawtooth-ish wave for more voice-like timbre
-      const saw = (phase % (2 * Math.PI)) / Math.PI - 1
-      output[i] = saw * amFiltered[i]
+      // Reverse the scaling: divide by (6 * FSCALE) to get back to voice frequency
+      phase += fmDemod[i] / (6 * FSCALE)
+      
+      // Generate a voice-like waveform with harmonics for natural speech timbre
+      const fundamental = Math.sin(phase) * VOICE_HARMONICS.h1
+      const h2 = Math.sin(2 * phase) * VOICE_HARMONICS.h2
+      const h3 = Math.sin(3 * phase) * VOICE_HARMONICS.h3
+      const h4 = Math.sin(4 * phase) * VOICE_HARMONICS.h4
+      const h5 = Math.sin(5 * phase) * VOICE_HARMONICS.h5
+      const wave = (fundamental + h2 + h3 + h4 + h5) / VOICE_HARMONIC_NORM
+      
+      output[i] = wave * amFiltered[i]
     }
 
-    // Apply smoothing filter for voice
-    const voiceLpf = createSincFilter(3000, 257, rate)
-    const smoothed = convolve(output, voiceLpf)
+    // Apply voice frequency filter
+    const smoothed = convolve(output, lpfVoice)
 
-    // Normalize
+    // Normalize output
     let maxAbs = 0
     for (let i = 0; i < length; i++) {
       const abs = Math.abs(smoothed[i])
