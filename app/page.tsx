@@ -17,12 +17,13 @@ export default function BlackbirdConverter() {
   const lastTapRef = useRef<number>(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Match exact Perl reference parameters
   const SAMPLE_RATE = 44100;
-  const FREQ_SCALE = 20;
-  const VOICE_CUTOFF = 400;
-  const BIRD_CUTOFF = 8000;
-  const BASE_FREQ = 3000;
+  const FSCALE = 24000;        // Frequency scaling factor from Perl
+  const SHIFT_FREQ = -0.005;   // Baseband shift frequency from Perl
+  const PHASE_MULT = 6;        // Phase multiplier: sin(phase * 6) from Perl
 
+  // Hilbert transform filter (90-degree phase shifter)
   const createHilbertFilter = (length: number): Float32Array => {
     const filter = new Float32Array(length);
     const mid = Math.floor(length / 2);
@@ -31,11 +32,13 @@ export default function BlackbirdConverter() {
       if (n === 0) filter[i] = 0;
       else if (n % 2 !== 0) filter[i] = 2 / (Math.PI * n);
       else filter[i] = 0;
+      // Hamming window
       filter[i] *= 0.54 - 0.46 * Math.cos((2 * Math.PI * i) / (length - 1));
     }
     return filter;
   };
 
+  // Sinc lowpass filter with Blackman window
   const createSincFilter = (cutoffHz: number, length: number, sampleRate: number): Float32Array => {
     const filter = new Float32Array(length);
     const mid = Math.floor(length / 2);
@@ -44,6 +47,7 @@ export default function BlackbirdConverter() {
       const n = i - mid;
       if (n === 0) filter[i] = 2 * Math.PI * fc;
       else filter[i] = Math.sin(2 * Math.PI * fc * n) / n;
+      // Blackman window for sharp cutoff
       filter[i] *= 0.42 - 0.5 * Math.cos((2 * Math.PI * i) / (length - 1)) + 
                   0.08 * Math.cos((4 * Math.PI * i) / (length - 1));
     }
@@ -68,133 +72,175 @@ export default function BlackbirdConverter() {
     return result;
   };
 
-  const getEnvelope = (signal: Float32Array, hilbert: Float32Array, lpf: Float32Array): Float32Array => {
-    const imag = convolve(signal, hilbert);
-    const envelope = new Float32Array(signal.length);
-    for (let i = 0; i < signal.length; i++) {
-      envelope[i] = Math.sqrt(signal[i] * signal[i] + imag[i] * imag[i]);
-    }
-    return convolve(envelope, lpf);
-  };
-
-  const getInstFreq = (signal: Float32Array, hilbert: Float32Array, rate: number): Float32Array => {
-    const imag = convolve(signal, hilbert);
-    const freq = new Float32Array(signal.length);
-    for (let i = 1; i < signal.length; i++) {
-      const re0 = signal[i - 1], im0 = imag[i - 1];
-      const re1 = signal[i], im1 = imag[i];
-      const cross = re1 * im0 - im1 * re0;
-      const dot = re1 * re0 + im1 * im0;
-      freq[i] = Math.atan2(cross, dot) * rate / (2 * Math.PI);
-    }
-    freq[0] = freq[1];
-    return freq;
-  };
-
-  const encodeAudio = async (audioBuffer: AudioBuffer): Promise<AudioBuffer> => {
+  // Encode voice to birdsong - exact match to Perl reference
+  const encodeAudio = async (audioBuffer: AudioBuffer): Promise<{encoded: AudioBuffer, fmData: Float32Array, amData: Float32Array}> => {
     const input = audioBuffer.getChannelData(0);
     const length = input.length;
     const rate = audioBuffer.sampleRate;
 
-    const hilbert = createHilbertFilter(255);
-    const voiceLpf = createSincFilter(VOICE_CUTOFF, 511, rate);
-    const envLpf = createSincFilter(50, 255, rate);
+    const hilbert = createHilbertFilter(129);
+    const lpf140 = createSincFilter(140, 1025, rate);  // Match Perl: sinc -140 -n 1024
+    const lpf70 = createSincFilter(70, 1025, rate);    // Match Perl: sinc -70 -n 1024
 
-    const voiceBand = convolve(input, voiceLpf);
-    const envelope = getEnvelope(voiceBand, hilbert, envLpf);
-    const instFreq = getInstFreq(voiceBand, hilbert, rate);
-    const freqSmoothed = convolve(instFreq, envLpf);
+    // Create analytic signal (real + j*hilbert)
+    const realPart = new Float32Array(input);
+    const imagPart = convolve(input, hilbert);
 
-    const output = new Float32Array(length);
-    let phase = 0;
-    
+    // Shift to baseband: multiply by exp(j * 2π * SHIFT_FREQ * n)
+    const shiftedI = new Float32Array(length);
+    const shiftedQ = new Float32Array(length);
+    const shiftOmega = 2 * Math.PI * SHIFT_FREQ;
     for (let i = 0; i < length; i++) {
-      const modulation = freqSmoothed[i] * FREQ_SCALE;
-      const birdFreq = BASE_FREQ + modulation;
-      phase += (2 * Math.PI * birdFreq) / rate;
-      const fundamental = Math.sin(phase);
-      const harmonic2 = 0.3 * Math.sin(phase * 2);
-      const harmonic3 = 0.1 * Math.sin(phase * 3);
-      output[i] = (fundamental + harmonic2 + harmonic3) * envelope[i];
+      const phase = shiftOmega * i;
+      const cosP = Math.cos(phase);
+      const sinP = Math.sin(phase);
+      // Complex multiplication: (real + j*imag) * (cos + j*sin)
+      shiftedI[i] = realPart[i] * cosP - imagPart[i] * sinP;
+      shiftedQ[i] = realPart[i] * sinP + imagPart[i] * cosP;
     }
 
+    // Filter at 140Hz to extract baseband signal
+    const filteredI = convolve(shiftedI, lpf140);
+    const filteredQ = convolve(shiftedQ, lpf140);
+
+    // Shift back for FM demodulation
+    const fmI = new Float32Array(length);
+    const fmQ = new Float32Array(length);
+    for (let i = 0; i < length; i++) {
+      const phase = 2 * Math.PI * 0.005 * i;  // shift back by +0.005
+      const cosP = Math.cos(phase);
+      const sinP = Math.sin(phase);
+      fmI[i] = filteredI[i] * cosP - filteredQ[i] * sinP;
+      fmQ[i] = filteredI[i] * sinP + filteredQ[i] * cosP;
+    }
+
+    // FM demodulation - extract instantaneous frequency (pitch information)
+    const fmDemod = new Float32Array(length);
+    for (let i = 1; i < length; i++) {
+      const cross = fmI[i] * fmQ[i - 1] - fmQ[i] * fmI[i - 1];
+      const dot = fmI[i] * fmI[i - 1] + fmQ[i] * fmQ[i - 1];
+      fmDemod[i] = Math.atan2(cross, dot);
+    }
+    fmDemod[0] = fmDemod[1];
+    const fmFiltered = convolve(fmDemod, lpf70);
+
+    // AM demodulation - extract envelope (amplitude information)
+    const amDemod = new Float32Array(length);
+    for (let i = 0; i < length; i++) {
+      amDemod[i] = Math.sqrt(filteredI[i] * filteredI[i] + filteredQ[i] * filteredQ[i]);
+    }
+    const amFiltered = convolve(amDemod, lpf70);
+
+    // Synthesize birdsong at scaled frequency
+    // Perl: $phase += $freq * $fscale; print pack "f", sin($phase * 6) * $amdemod;
+    const output = new Float32Array(length);
+    let phase = 0;
+    for (let i = 0; i < length; i++) {
+      const freq = (fmFiltered[i] * 2 * Math.PI) / rate;
+      phase += freq * FSCALE;
+      output[i] = Math.sin(phase * PHASE_MULT) * amFiltered[i];
+    }
+
+    // Normalize output
     let maxAbs = 0;
-    for (let i = 0; i < length; i++) if (Math.abs(output[i]) > maxAbs) maxAbs = Math.abs(output[i]);
-    if (maxAbs > 0) for (let i = 0; i < length; i++) output[i] *= 0.9 / maxAbs;
+    for (let i = 0; i < length; i++) {
+      const abs = Math.abs(output[i]);
+      if (abs > maxAbs) maxAbs = abs;
+    }
+    if (maxAbs > 0) {
+      for (let i = 0; i < length; i++) output[i] *= 0.9 / maxAbs;
+    }
 
     const ctx = audioContextRef.current!;
     const outputBuffer = ctx.createBuffer(1, length, rate);
     outputBuffer.getChannelData(0).set(output);
-    return outputBuffer;
+    
+    return { encoded: outputBuffer, fmData: fmFiltered, amData: amFiltered };
   };
 
+  // Decode birdsong back to voice - perfect inversion of encoding
   const decodeAudio = async (audioBuffer: AudioBuffer): Promise<AudioBuffer> => {
     const input = audioBuffer.getChannelData(0);
     const length = input.length;
     const rate = audioBuffer.sampleRate;
 
-    const hilbert = createHilbertFilter(255);
-    // Bandpass around birdsong frequency range to isolate the carrier
-    const birdLpf = createSincFilter(BIRD_CUTOFF, 511, rate);
-    // Envelope filter: 200Hz bandwidth preserves speech transients
-    const envLpf = createSincFilter(200, 127, rate);
-    // Frequency smoothing: 80Hz balances noise reduction with articulation preservation
-    const freqLpf = createSincFilter(80, 255, rate);
+    const hilbert = createHilbertFilter(129);
+    const lpf70 = createSincFilter(70, 1025, rate);
 
-    const birdBand = convolve(input, birdLpf);
-    const envelope = getEnvelope(birdBand, hilbert, envLpf);
-    const instFreq = getInstFreq(birdBand, hilbert, rate);
-    
-    // Median filter to remove frequency spikes (improves robustness)
+    // Create analytic signal from birdsong
+    const realPart = new Float32Array(input);
+    const imagPart = convolve(input, hilbert);
+
+    // FM demodulation to extract instantaneous frequency from birdsong
+    // This gives us: birdsong_inst_freq = original_fm * FSCALE * PHASE_MULT (in radians/sample)
+    const fmDemod = new Float32Array(length);
+    for (let i = 1; i < length; i++) {
+      const cross = realPart[i] * imagPart[i - 1] - imagPart[i] * realPart[i - 1];
+      const dot = realPart[i] * realPart[i - 1] + imagPart[i] * imagPart[i - 1];
+      fmDemod[i] = Math.atan2(cross, dot);
+    }
+    fmDemod[0] = fmDemod[1];
+
+    // Median filter to remove spikes from FM demodulation
     const medianFiltered = new Float32Array(length);
     const windowSize = 5;
     const halfWindow = Math.floor(windowSize / 2);
-    const medianSamples = new Array<number>(windowSize);
     for (let i = 0; i < length; i++) {
+      const samples: number[] = [];
       for (let j = 0; j < windowSize; j++) {
         const idx = Math.max(0, Math.min(length - 1, i - halfWindow + j));
-        medianSamples[j] = instFreq[idx];
+        samples.push(fmDemod[idx]);
       }
-      medianSamples.sort((a, b) => a - b);
-      medianFiltered[i] = medianSamples[halfWindow];
+      samples.sort((a, b) => a - b);
+      medianFiltered[i] = samples[halfWindow];
     }
-    
-    const freqSmoothed = convolve(medianFiltered, freqLpf);
 
+    // Smooth the frequency
+    const fmFiltered = convolve(medianFiltered, lpf70);
+
+    // AM demodulation to extract original envelope
+    const amDemod = new Float32Array(length);
+    for (let i = 0; i < length; i++) {
+      amDemod[i] = Math.sqrt(realPart[i] * realPart[i] + imagPart[i] * imagPart[i]);
+    }
+    const amFiltered = convolve(amDemod, lpf70);
+
+    // Reconstruct original voice
+    // Encoding: phase += (fm * 2π/rate) * FSCALE; output = sin(phase * PHASE_MULT) * am
+    // The birdsong inst_freq (in radians/sample) = fm_original * 2π/rate * FSCALE * PHASE_MULT
+    // To decode: original_fm = birdsong_inst_freq * rate / (2π * FSCALE * PHASE_MULT)
     const output = new Float32Array(length);
     let phase = 0;
-    
-    // Harmonic amplitudes for glottal pulse approximation (decreasing ~6dB/octave)
-    const harmonicAmps = [1.0, 0.7, 0.5, 0.35, 0.25, 0.18, 0.12, 0.08];
-    const harmonicNorm = harmonicAmps.reduce((sum, amp) => sum + amp, 0);
-    
+
     for (let i = 0; i < length; i++) {
-      // Recover original voice frequency: birdFreq = BASE_FREQ + voiceFreq * FREQ_SCALE
-      // Therefore: voiceFreq = (birdFreq - BASE_FREQ) / FREQ_SCALE
-      // The encoding used instFreq (which can be negative for descending tones)
-      // so we don't strictly clamp to positive values
-      const rawVoiceFreq = (freqSmoothed[i] - BASE_FREQ) / FREQ_SCALE;
-      // Clamp to reasonable voice range but allow full speech bandwidth
-      const voiceFreq = Math.max(20, Math.min(VOICE_CUTOFF, Math.abs(rawVoiceFreq)));
-      phase += (2 * Math.PI * voiceFreq) / rate;
+      // Recover original phase increment
+      // fmFiltered[i] is in radians/sample (birdsong instantaneous frequency)
+      // Original: freq = (fmOriginal * 2π) / rate, then phase += freq * FSCALE, then sin(phase * PHASE_MULT)
+      // So birdsong_inst_freq = fmOriginal * 2π / rate * FSCALE * PHASE_MULT
+      // Therefore: fmOriginal = fmFiltered[i] * rate / (2π * FSCALE * PHASE_MULT)
+      const originalFm = fmFiltered[i] * rate / (2 * Math.PI * FSCALE * PHASE_MULT);
       
-      // Generate glottal-like pulse with rich harmonics for natural voice timbre
-      let wave = 0;
-      for (let h = 0; h < harmonicAmps.length; h++) {
-        wave += Math.sin((h + 1) * phase) * harmonicAmps[h];
-      }
-      wave /= harmonicNorm;
+      // The original encoding had: freq = (fmFiltered * 2π) / rate
+      // This was then phase accumulated. To reverse:
+      phase += originalFm;
       
-      output[i] = wave * envelope[i];
+      // Generate sine wave at original frequency with original envelope
+      output[i] = Math.sin(phase) * amFiltered[i];
     }
 
-    // Apply formant-like emphasis - 4kHz includes most speech formant information
-    const voiceWide = createSincFilter(4000, 127, rate);
-    const smoothed = convolve(output, voiceWide);
-    
+    // Apply lowpass filter to remove high frequency artifacts
+    const lpf4000 = createSincFilter(4000, 257, rate);
+    const smoothed = convolve(output, lpf4000);
+
+    // Normalize
     let maxAbs = 0;
-    for (let i = 0; i < length; i++) if (Math.abs(smoothed[i]) > maxAbs) maxAbs = Math.abs(smoothed[i]);
-    if (maxAbs > 0) for (let i = 0; i < length; i++) smoothed[i] *= 0.9 / maxAbs;
+    for (let i = 0; i < length; i++) {
+      const abs = Math.abs(smoothed[i]);
+      if (abs > maxAbs) maxAbs = abs;
+    }
+    if (maxAbs > 0) {
+      for (let i = 0; i < length; i++) smoothed[i] *= 0.9 / maxAbs;
+    }
 
     const ctx = audioContextRef.current!;
     const outputBuffer = ctx.createBuffer(1, length, rate);
@@ -234,7 +280,7 @@ export default function BlackbirdConverter() {
   const startRecording = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: SAMPLE_RATE },
       });
       audioContextRef.current = new AudioContext({ sampleRate: SAMPLE_RATE });
       const analyser = audioContextRef.current.createAnalyser();
@@ -268,7 +314,8 @@ export default function BlackbirdConverter() {
         const blob = new Blob(chunksRef.current, { type: "audio/webm" });
         const arrayBuffer = await blob.arrayBuffer();
         const audioBuffer = await audioContextRef.current!.decodeAudioData(arrayBuffer);
-        const birdBuffer = await encodeAudio(audioBuffer);
+        
+        const { encoded: birdBuffer } = await encodeAudio(audioBuffer);
         setProcessedBuffer(birdBuffer);
         setMode("encode");
 
@@ -298,7 +345,7 @@ export default function BlackbirdConverter() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = mode === "encode" ? "chirp.wav" : "decoded.wav";
+    a.download = mode === "encode" ? "blackbird.wav" : "voice.wav";
     a.click();
     URL.revokeObjectURL(url);
   }, [processedBuffer, mode]);
@@ -348,18 +395,25 @@ export default function BlackbirdConverter() {
     }
   };
 
+  // Blackbird SVG icon matching the app icon
+  const BlackbirdIcon = () => (
+    <svg viewBox="0 0 100 100" className="w-6 h-6" fill="currentColor">
+      <path d="M75 25c-5 0-10 3-13 7l-5-2c-3-1-6 0-8 2L35 45c-2 2-3 5-2 8l2 5c-4 3-7 8-7 13 0 2 0 4 1 6l-8 8c-1 1-1 3 0 4s3 1 4 0l8-8c2 1 4 1 6 1 5 0 10-3 13-7l5 2c3 1 6 0 8-2l14-13c2-2 3-5 2-8l-2-5c4-3 7-8 7-13 0-9-7-16-16-16zM39 73c-3 0-6-1-8-3l15-15c2 2 3 5 3 8 0 6-4 10-10 10zm22-12l-4-2 10-10 2 4c1 2 0 4-1 5l-4 4c-1 1-2 1-3-1zm8-18c-2-2-3-5-3-8 0-6 4-10 10-10s10 4 10 10c0 3-1 6-3 8L68 58l-2-4c-1-2 0-4 1-5l4-4c1-1 3-1 4 1l4 2-10 10z"/>
+    </svg>
+  );
+
   return (
-    <div className="min-h-screen bg-neutral-950 flex flex-col items-center justify-center relative select-none">
-      {/* Header */}
-      <div className="absolute top-4 left-4 flex items-center gap-1.5">
-        <svg className="w-4 h-4 text-neutral-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-          <path d="M16 7h.01M3.4 18H12a8 8 0 0 0 8-8V7a4 4 0 0 0-7.28-2.28L2 20l1.4-2Z" />
-        </svg>
-        <span className="text-[10px] font-mono text-neutral-500 uppercase tracking-wider">blackbird</span>
+    <div className="min-h-screen bg-white flex flex-col items-center justify-center relative select-none">
+      {/* Header - minimal blackbird branding */}
+      <div className="absolute top-6 left-6 flex items-center gap-2">
+        <div className="text-black">
+          <BlackbirdIcon />
+        </div>
+        <span className="text-xs font-medium text-black tracking-wide">blackbird</span>
       </div>
 
-      {/* Controls */}
-      <div className="absolute top-4 right-4 flex items-center gap-2">
+      {/* Controls - top right */}
+      <div className="absolute top-6 right-6 flex items-center gap-3">
         <input 
           ref={fileInputRef} 
           type="file" 
@@ -369,66 +423,66 @@ export default function BlackbirdConverter() {
         />
         <button
           onClick={() => fileInputRef.current?.click()}
-          className="p-2 rounded-full hover:bg-neutral-800 transition-colors"
+          className="p-2 rounded-full hover:bg-gray-100 transition-colors"
           title="Upload birdsong to decode"
         >
-          <svg className="w-4 h-4 text-neutral-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg className="w-5 h-5 text-gray-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
           </svg>
         </button>
         {processedBuffer && state === "idle" && (
           <button
             onClick={handleDownload}
-            className="p-2 rounded-full hover:bg-neutral-800 transition-colors"
+            className="p-2 rounded-full hover:bg-gray-100 transition-colors"
             title="Download"
           >
-            <svg className="w-4 h-4 text-neutral-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <svg className="w-5 h-5 text-gray-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" />
             </svg>
           </button>
         )}
       </div>
 
-      {/* Main Button */}
+      {/* Main Button - clean circular design */}
       <button
         onClick={handleTap}
         disabled={state === "processing"}
-        className="relative w-24 h-24 rounded-full bg-neutral-900 border border-neutral-800 flex items-center justify-center transition-all active:scale-95 hover:bg-neutral-800"
+        className="relative w-28 h-28 rounded-full bg-white border-2 border-gray-200 flex items-center justify-center transition-all active:scale-95 hover:border-gray-300 hover:shadow-lg shadow-md"
       >
         {state === "processing" ? (
-          <svg className="w-6 h-6 text-neutral-500 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg className="w-8 h-8 text-gray-400 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M21 12a9 9 0 1 1-6.219-8.56" />
           </svg>
         ) : state === "recording" ? (
           <>
             <div
-              className="absolute inset-0 rounded-full bg-red-500/20 transition-transform"
-              style={{ transform: `scale(${1 + audioLevel * 0.4})`, opacity: 0.5 + audioLevel * 0.5 }}
+              className="absolute inset-0 rounded-full bg-black/5 transition-transform"
+              style={{ transform: `scale(${1 + audioLevel * 0.3})`, opacity: 0.3 + audioLevel * 0.7 }}
             />
-            <div className="w-5 h-5 bg-red-500 rounded-sm" />
+            <div className="w-6 h-6 bg-black rounded-sm" />
           </>
         ) : state === "playing" ? (
-          <div className="w-5 h-5 bg-neutral-300 rounded-sm" />
+          <div className="w-6 h-6 bg-black rounded-sm" />
         ) : (
-          <svg className="w-7 h-7 text-neutral-300" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg className="w-8 h-8 text-black" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
             <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3" />
           </svg>
         )}
       </button>
 
-      {/* Status */}
-      <p className="mt-6 text-[11px] text-neutral-500 font-mono">
-        {state === "idle" && "tap to record voice"}
-        {state === "recording" && "recording..."}
-        {state === "processing" && (mode === "decode" ? "decoding birdsong..." : "encoding to birdsong...")}
-        {state === "playing" && (mode === "decode" ? "▶ decoded voice" : "▶ birdsong")}
+      {/* Status text */}
+      <p className="mt-8 text-sm text-gray-500 font-medium">
+        {state === "idle" && "Tap to record"}
+        {state === "recording" && "Recording..."}
+        {state === "processing" && (mode === "decode" ? "Restoring voice..." : "Converting to birdsong...")}
+        {state === "playing" && (mode === "decode" ? "Playing restored voice" : "Playing birdsong")}
       </p>
 
-      {/* Instructions */}
+      {/* Instructions - bottom */}
       <div className="absolute bottom-8 text-center">
-        <p className="text-[10px] text-neutral-600 font-mono">
-          record voice → birdsong • upload birdsong → voice
+        <p className="text-xs text-gray-400">
+          Record voice → Birdsong &nbsp;•&nbsp; Upload birdsong → Original voice
         </p>
       </div>
     </div>
