@@ -157,11 +157,11 @@ export default function BlackbirdConverter() {
 
     // Synthesize birdsong at scaled frequency
     const birdsong = new Float32Array(length);
-    let phase = 0;
+    let synthPhase = 0;
     for (let i = 0; i < length; i++) {
       const freq = (fmFiltered[i] * 2 * Math.PI) / rate;
-      phase += freq * FSCALE;
-      birdsong[i] = Math.sin(phase * PHASE_MULT) * amFiltered[i];
+      synthPhase += freq * FSCALE;
+      birdsong[i] = Math.sin(synthPhase * PHASE_MULT) * amFiltered[i];
     }
 
     // Normalize birdsong to 0.85 for headroom
