@@ -27,6 +27,9 @@ export function BlackbirdConverter() {
   const SAMPLE_RATE = 44100
   const FSCALE = 24000
   const SHIFT_FREQ = -0.005
+  // Harmonic coefficients for voice-like waveform synthesis during decoding
+  const VOICE_HARMONICS = { h1: 1, h2: 0.5, h3: 0.4, h4: 0.25, h5: 0.15 }
+  const VOICE_HARMONIC_NORM = 2.3 // Sum of coefficients for normalization
 
   const createHilbertFilter = (length: number): Float32Array => {
     const filter = new Float32Array(length)
@@ -194,19 +197,10 @@ export function BlackbirdConverter() {
     }
     const amFiltered = convolve(amDemod, lpfEnvelope)
 
-    // Encoding formula:
-    //   freq = (fmFiltered[i] * 2 * Math.PI) / rate
-    //   phase += freq * FSCALE
-    //   output = sin(phase * 6) * am
-    // 
-    // Birdsong phase increment per sample = 6 * FSCALE * fmFiltered * 2π / rate
-    // FM demod gives us the phase increment per sample of the birdsong
-    // So: fmDemod = 6 * FSCALE * fmFiltered * 2π / rate
-    //     fmFiltered = fmDemod * rate / (6 * FSCALE * 2π)
-    // 
-    // To resynthesize voice at original pitch:
-    //   voice_phase += fmFiltered * 2π / rate
-    //   voice_phase += fmDemod / (6 * FSCALE)
+    // Decoding: Reverse the frequency scaling used in encoding
+    // Encoding used: phase += (fm * 2π/rate) * FSCALE, output = sin(phase * 6)
+    // So birdsong phase increment = 6 * FSCALE * original_fm
+    // To recover voice, divide by (6 * FSCALE)
     
     const output = new Float32Array(length)
     let phase = 0
@@ -215,14 +209,13 @@ export function BlackbirdConverter() {
       // Reverse the scaling: divide by (6 * FSCALE) to get back to voice frequency
       phase += fmDemod[i] / (6 * FSCALE)
       
-      // Generate a voice-like waveform with harmonics
-      // Human voice typically has strong odd harmonics
-      const fundamental = Math.sin(phase)
-      const h2 = Math.sin(2 * phase) * 0.5
-      const h3 = Math.sin(3 * phase) * 0.4
-      const h4 = Math.sin(4 * phase) * 0.25
-      const h5 = Math.sin(5 * phase) * 0.15
-      const wave = (fundamental + h2 + h3 + h4 + h5) / 2.3
+      // Generate a voice-like waveform with harmonics for natural speech timbre
+      const fundamental = Math.sin(phase) * VOICE_HARMONICS.h1
+      const h2 = Math.sin(2 * phase) * VOICE_HARMONICS.h2
+      const h3 = Math.sin(3 * phase) * VOICE_HARMONICS.h3
+      const h4 = Math.sin(4 * phase) * VOICE_HARMONICS.h4
+      const h5 = Math.sin(5 * phase) * VOICE_HARMONICS.h5
+      const wave = (fundamental + h2 + h3 + h4 + h5) / VOICE_HARMONIC_NORM
       
       output[i] = wave * amFiltered[i]
     }
