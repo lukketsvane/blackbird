@@ -395,25 +395,15 @@ export default function BlackbirdConverter() {
     }
   };
 
-  // Blackbird SVG icon matching the app icon
-  const BlackbirdIcon = () => (
-    <svg viewBox="0 0 100 100" className="w-6 h-6" fill="currentColor">
-      <path d="M75 25c-5 0-10 3-13 7l-5-2c-3-1-6 0-8 2L35 45c-2 2-3 5-2 8l2 5c-4 3-7 8-7 13 0 2 0 4 1 6l-8 8c-1 1-1 3 0 4s3 1 4 0l8-8c2 1 4 1 6 1 5 0 10-3 13-7l5 2c3 1 6 0 8-2l14-13c2-2 3-5 2-8l-2-5c4-3 7-8 7-13 0-9-7-16-16-16zM39 73c-3 0-6-1-8-3l15-15c2 2 3 5 3 8 0 6-4 10-10 10zm22-12l-4-2 10-10 2 4c1 2 0 4-1 5l-4 4c-1 1-2 1-3-1zm8-18c-2-2-3-5-3-8 0-6 4-10 10-10s10 4 10 10c0 3-1 6-3 8L68 58l-2-4c-1-2 0-4 1-5l4-4c1-1 3-1 4 1l4 2-10 10z"/>
-    </svg>
-  );
-
   return (
-    <div className="min-h-screen bg-white flex flex-col items-center justify-center relative select-none">
-      {/* Header - minimal blackbird branding */}
-      <div className="absolute top-6 left-6 flex items-center gap-2">
-        <div className="text-black">
-          <BlackbirdIcon />
-        </div>
-        <span className="text-xs font-medium text-black tracking-wide">blackbird</span>
+    <div className="fixed inset-0 w-screen h-screen bg-background flex flex-col items-center justify-center select-none overflow-hidden touch-none">
+      {/* Header */}
+      <div className="absolute top-6 left-6 safe-top">
+        <span className="text-xs font-medium text-foreground tracking-wide">blackbird</span>
       </div>
 
-      {/* Controls - top right */}
-      <div className="absolute top-6 right-6 flex items-center gap-3">
+      {/* Controls */}
+      <div className="absolute top-6 right-6 flex items-center gap-2 safe-top">
         <input 
           ref={fileInputRef} 
           type="file" 
@@ -423,66 +413,66 @@ export default function BlackbirdConverter() {
         />
         <button
           onClick={() => fileInputRef.current?.click()}
-          className="p-2 rounded-full hover:bg-gray-100 transition-colors"
-          title="Upload birdsong to decode"
+          className="w-10 h-10 rounded-full flex items-center justify-center active:bg-secondary transition-colors"
+          title="Upload"
         >
-          <svg className="w-5 h-5 text-gray-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg className="w-5 h-5 text-muted-foreground" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
           </svg>
         </button>
         {processedBuffer && state === "idle" && (
           <button
             onClick={handleDownload}
-            className="p-2 rounded-full hover:bg-gray-100 transition-colors"
+            className="w-10 h-10 rounded-full flex items-center justify-center active:bg-secondary transition-colors"
             title="Download"
           >
-            <svg className="w-5 h-5 text-gray-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <svg className="w-5 h-5 text-muted-foreground" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" />
             </svg>
           </button>
         )}
       </div>
 
-      {/* Main Button - clean circular design */}
+      {/* Main Button */}
       <button
         onClick={handleTap}
         disabled={state === "processing"}
-        className="relative w-28 h-28 rounded-full bg-white border-2 border-gray-200 flex items-center justify-center transition-all active:scale-95 hover:border-gray-300 hover:shadow-lg shadow-md"
+        className="relative w-24 h-24 rounded-full bg-secondary border border-border flex items-center justify-center transition-transform active:scale-95"
       >
         {state === "processing" ? (
-          <svg className="w-8 h-8 text-gray-400 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg className="w-7 h-7 text-muted-foreground animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M21 12a9 9 0 1 1-6.219-8.56" />
           </svg>
         ) : state === "recording" ? (
           <>
             <div
-              className="absolute inset-0 rounded-full bg-black/5 transition-transform"
+              className="absolute inset-0 rounded-full bg-foreground/10 transition-transform"
               style={{ transform: `scale(${1 + audioLevel * 0.3})`, opacity: 0.3 + audioLevel * 0.7 }}
             />
-            <div className="w-6 h-6 bg-black rounded-sm" />
+            <div className="w-5 h-5 bg-foreground rounded-sm" />
           </>
         ) : state === "playing" ? (
-          <div className="w-6 h-6 bg-black rounded-sm" />
+          <div className="w-5 h-5 bg-foreground rounded-sm" />
         ) : (
-          <svg className="w-8 h-8 text-black" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <svg className="w-7 h-7 text-foreground" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
             <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3" />
           </svg>
         )}
       </button>
 
-      {/* Status text */}
-      <p className="mt-8 text-sm text-gray-500 font-medium">
-        {state === "idle" && "Tap to record"}
-        {state === "recording" && "Recording..."}
-        {state === "processing" && (mode === "decode" ? "Restoring voice..." : "Converting to birdsong...")}
-        {state === "playing" && (mode === "decode" ? "Playing restored voice" : "Playing birdsong")}
+      {/* Status */}
+      <p className="mt-6 text-sm text-muted-foreground font-medium">
+        {state === "idle" && "tap to record"}
+        {state === "recording" && "recording"}
+        {state === "processing" && (mode === "decode" ? "decoding" : "encoding")}
+        {state === "playing" && (mode === "decode" ? "voice" : "birdsong")}
       </p>
 
-      {/* Instructions - bottom */}
-      <div className="absolute bottom-8 text-center">
-        <p className="text-xs text-gray-400">
-          Record voice → Birdsong &nbsp;•&nbsp; Upload birdsong → Original voice
+      {/* Footer */}
+      <div className="absolute bottom-6 text-center safe-bottom">
+        <p className="text-xs text-muted-foreground">
+          made with &lt;3 by <a href="https://github.com/lukketsvane/blackbird" className="active:text-foreground transition-colors">@lukketsvane</a>
         </p>
       </div>
     </div>
