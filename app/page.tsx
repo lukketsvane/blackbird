@@ -25,11 +25,9 @@ export default function BlackbirdConverter() {
   const SHIFT_FREQ = -0.005;   // Baseband shift frequency from Perl
   const PHASE_MULT = 6;        // Phase multiplier: sin(phase * 6) from Perl
 
-  // Ultrasonic steganography constants
-  // Voice is modulated onto ultrasonic carrier (inaudible to humans)
-  // and mixed into the mono birdsong output
-  const ULTRASONIC_CARRIER = 19000;  // 19kHz carrier (above human hearing)
-  const ULTRASONIC_AMPLITUDE = 0.25; // Amplitude for embedded voice (strong enough for recovery)
+  // Steganographic embedding - voice hidden in right channel
+  // At this amplitude, voice is masked by louder birdsong in left channel
+  const HIDDEN_VOICE_AMPLITUDE = 0.15; // -16dB, good quantization but masked by birdsong
 
   // Hilbert transform filter (90-degree phase shifter)
   const createHilbertFilter = (length: number): Float32Array => {
@@ -80,26 +78,8 @@ export default function BlackbirdConverter() {
     return result;
   };
 
-  // Bandpass filter (combines highpass and lowpass)
-  const createBandpassFilter = (lowHz: number, highHz: number, length: number, sampleRate: number): Float32Array => {
-    const lpf = createSincFilter(highHz, length, sampleRate);
-    const hpfLow = createSincFilter(lowHz, length, sampleRate);
-    const result = new Float32Array(length);
-    const mid = Math.floor(length / 2);
-    // Bandpass = lowpass(high) - lowpass(low) with spectral inversion for highpass
-    for (let i = 0; i < length; i++) {
-      result[i] = lpf[i] - hpfLow[i];
-    }
-    // Add impulse at center for proper bandpass
-    result[mid] += 1;
-    for (let i = 0; i < length; i++) {
-      result[i] = lpf[i] - hpfLow[i];
-    }
-    return result;
-  };
-
-  // Encode voice to birdsong with ultrasonic steganographic embedding
-  // Voice is modulated onto 19kHz carrier (inaudible) and mixed into mono output
+  // Encode voice to birdsong with steganographic embedding
+  // Creates stereo: Left = birdsong (audible), Right = original voice (for perfect decoding)
   const encodeAudio = async (audioBuffer: AudioBuffer): Promise<AudioBuffer> => {
     const input = audioBuffer.getChannelData(0);
     const length = input.length;
@@ -108,7 +88,6 @@ export default function BlackbirdConverter() {
     const hilbert = createHilbertFilter(129);
     const lpf140 = createSincFilter(140, 1025, rate);
     const lpf70 = createSincFilter(70, 1025, rate);
-    const lpfVoice = createSincFilter(3500, 513, rate); // Limit voice to 3.5kHz for ultrasonic band
 
     // Create analytic signal (real + j*hilbert)
     const realPart = new Float32Array(input);
@@ -167,167 +146,87 @@ export default function BlackbirdConverter() {
       birdsong[i] = Math.sin(phase * PHASE_MULT) * amFiltered[i];
     }
 
-    // Normalize birdsong to 0.7 to leave headroom for ultrasonic embedding
+    // Normalize birdsong
     let maxBird = 0;
     for (let i = 0; i < length; i++) {
       const abs = Math.abs(birdsong[i]);
       if (abs > maxBird) maxBird = abs;
     }
     if (maxBird > 0) {
-      for (let i = 0; i < length; i++) birdsong[i] *= 0.7 / maxBird;
+      for (let i = 0; i < length; i++) birdsong[i] *= 0.9 / maxBird;
     }
 
-    // === ULTRASONIC STEGANOGRAPHY ===
-    // Bandlimit original voice to 3.5kHz for ultrasonic embedding
-    const bandlimitedVoice = convolve(input, lpfVoice);
-
-    // Normalize the bandlimited voice
+    // Prepare hidden voice at reduced amplitude (masked by birdsong)
+    const hiddenVoice = new Float32Array(length);
     let maxVoice = 0;
     for (let i = 0; i < length; i++) {
-      const abs = Math.abs(bandlimitedVoice[i]);
+      const abs = Math.abs(input[i]);
       if (abs > maxVoice) maxVoice = abs;
     }
-    const normalizedVoice = new Float32Array(length);
     if (maxVoice > 0) {
       for (let i = 0; i < length; i++) {
-        normalizedVoice[i] = bandlimitedVoice[i] / maxVoice;
+        hiddenVoice[i] = (input[i] / maxVoice) * HIDDEN_VOICE_AMPLITUDE;
       }
     }
 
-    // AM modulate voice onto ultrasonic carrier (19kHz)
-    // Using Double Sideband Suppressed Carrier (DSB-SC) for efficiency
-    const ultrasonicOmega = 2 * Math.PI * ULTRASONIC_CARRIER / rate;
-    const modulatedUltrasonic = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-      // DSB-SC modulation: voice * cos(carrier)
-      modulatedUltrasonic[i] = normalizedVoice[i] * Math.cos(ultrasonicOmega * i) * ULTRASONIC_AMPLITUDE;
-    }
-
-    // Combine birdsong with ultrasonic embedded voice
-    const output = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-      output[i] = birdsong[i] + modulatedUltrasonic[i];
-    }
-
-    // Final limiting to prevent clipping
-    let maxOut = 0;
-    for (let i = 0; i < length; i++) {
-      const abs = Math.abs(output[i]);
-      if (abs > maxOut) maxOut = abs;
-    }
-    if (maxOut > 0.95) {
-      const scale = 0.95 / maxOut;
-      for (let i = 0; i < length; i++) output[i] *= scale;
-    }
-
-    // Create MONO buffer (no stereo channel leakage)
+    // Create STEREO buffer: Left = birdsong, Right = hidden voice
     const ctx = audioContextRef.current!;
-    const outputBuffer = ctx.createBuffer(1, length, rate);
-    outputBuffer.getChannelData(0).set(output);
+    const outputBuffer = ctx.createBuffer(2, length, rate);
+    outputBuffer.getChannelData(0).set(birdsong);
+    outputBuffer.getChannelData(1).set(hiddenVoice);
 
     return outputBuffer;
   };
 
   // Decode birdsong back to voice
-  // Extracts voice from ultrasonic band (19kHz carrier) using coherent demodulation
+  // PRIMARY: Extract original voice from right channel (perfect reconstruction)
+  // FALLBACK: Use signal processing if right channel is empty (lossy)
   const decodeAudio = async (audioBuffer: AudioBuffer): Promise<AudioBuffer> => {
     const length = audioBuffer.length;
     const rate = audioBuffer.sampleRate;
     const ctx = audioContextRef.current!;
-    const input = audioBuffer.getChannelData(0);
 
-    // Create filters for ultrasonic extraction
-    const lpfDemod = createSincFilter(4000, 513, rate);  // Post-demodulation filter
-    const hilbert = createHilbertFilter(129);
-
-    // === ULTRASONIC DEMODULATION ===
-    // Coherent demodulation: multiply by carrier and lowpass filter
-    const ultrasonicOmega = 2 * Math.PI * ULTRASONIC_CARRIER / rate;
-
-    // Demodulate with in-phase carrier (I channel)
-    const demodI = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-      demodI[i] = input[i] * Math.cos(ultrasonicOmega * i) * 2; // *2 to recover amplitude
-    }
-
-    // Demodulate with quadrature carrier (Q channel) for envelope detection
-    const demodQ = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-      demodQ[i] = input[i] * Math.sin(ultrasonicOmega * i) * 2;
-    }
-
-    // Lowpass filter both channels to remove 2*carrier frequency component
-    const filteredI = convolve(demodI, lpfDemod);
-    const filteredQ = convolve(demodQ, lpfDemod);
-
-    // Compute envelope (magnitude of I/Q) for robust recovery
-    // This handles any phase offset in the carrier
-    const envelope = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-      envelope[i] = Math.sqrt(filteredI[i] * filteredI[i] + filteredQ[i] * filteredQ[i]);
-    }
-
-    // Check if ultrasonic content is present (energy detection)
-    let ultrasonicEnergy = 0;
-    for (let i = 0; i < Math.min(length, rate); i++) {
-      ultrasonicEnergy += envelope[i] * envelope[i];
-    }
-    ultrasonicEnergy /= Math.min(length, rate);
-
-    // If ultrasonic voice is detected, use it
-    if (ultrasonicEnergy > 0.0001) {
-      // The demodulated signal preserves the original waveform polarity
-      // Use I channel directly since our encoding used cos() carrier
-      const voice = new Float32Array(length);
-
-      // Apply additional smoothing
-      const lpfSmooth = createSincFilter(3500, 257, rate);
-      const smoothed = convolve(filteredI, lpfSmooth);
-
-      // Normalize to audible level
-      let maxAmp = 0;
-      for (let i = 0; i < length; i++) {
-        const abs = Math.abs(smoothed[i]);
-        if (abs > maxAmp) maxAmp = abs;
-      }
-      if (maxAmp > 0) {
-        for (let i = 0; i < length; i++) {
-          voice[i] = smoothed[i] * 0.9 / maxAmp;
-        }
-      }
-
-      const outputBuffer = ctx.createBuffer(1, length, rate);
-      outputBuffer.getChannelData(0).set(voice);
-      return outputBuffer;
-    }
-
-    // === LEGACY SUPPORT: Check for stereo right channel ===
+    // === PRIMARY: Extract voice from stereo right channel ===
     if (audioBuffer.numberOfChannels >= 2) {
       const rightChannel = audioBuffer.getChannelData(1);
+
+      // Check if right channel has audio content
       let rightEnergy = 0;
-      for (let i = 0; i < Math.min(length, rate); i++) {
+      for (let i = 0; i < length; i++) {
         rightEnergy += rightChannel[i] * rightChannel[i];
       }
-      rightEnergy /= Math.min(length, rate);
+      rightEnergy /= length;
 
-      if (rightEnergy > 0.0000001) {
-        const amplifiedVoice = new Float32Array(length);
+      // If right channel has meaningful audio, extract and amplify it
+      // Threshold accounts for HIDDEN_VOICE_AMPLITUDE (0.15)
+      if (rightEnergy > 0.00001) {
+        const voice = new Float32Array(length);
+
+        // Find max amplitude for normalization
         let maxAmp = 0;
         for (let i = 0; i < length; i++) {
           const abs = Math.abs(rightChannel[i]);
           if (abs > maxAmp) maxAmp = abs;
         }
+
+        // Amplify to full volume (perfect reconstruction)
         if (maxAmp > 0) {
-          for (let i = 0; i < length; i++) amplifiedVoice[i] = rightChannel[i] * 0.9 / maxAmp;
+          for (let i = 0; i < length; i++) {
+            voice[i] = rightChannel[i] * 0.9 / maxAmp;
+          }
         }
+
         const outputBuffer = ctx.createBuffer(1, length, rate);
-        outputBuffer.getChannelData(0).set(amplifiedVoice);
+        outputBuffer.getChannelData(0).set(voice);
         return outputBuffer;
       }
     }
 
-    // === FALLBACK: Signal processing reconstruction ===
+    // === FALLBACK: Signal processing reconstruction (for mono files) ===
+    const input = audioBuffer.getChannelData(0);
+    const hilbert = createHilbertFilter(129);
     const lpf70 = createSincFilter(70, 1025, rate);
+
     const realPart = new Float32Array(input);
     const imagPart = convolve(input, hilbert);
 
@@ -340,7 +239,7 @@ export default function BlackbirdConverter() {
     }
     fmDemod[0] = fmDemod[1];
 
-    // Median filter
+    // Median filter to remove spikes
     const medianFiltered = new Float32Array(length);
     const windowSize = 5;
     const halfWindow = Math.floor(windowSize / 2);
@@ -538,10 +437,14 @@ export default function BlackbirdConverter() {
           setBlobUrl(url);
         }
 
-        // Output is already mono with ultrasonic embedded voice (inaudible to humans)
+        // Create mono buffer with only birdsong (left channel) for playback
+        // The stereo buffer is kept for download (right channel has hidden voice)
+        const monoPlayback = audioContextRef.current!.createBuffer(1, birdBuffer.length, birdBuffer.sampleRate);
+        monoPlayback.getChannelData(0).set(birdBuffer.getChannelData(0));
+
         setState("playing");
         const src = audioContextRef.current!.createBufferSource();
-        src.buffer = birdBuffer;
+        src.buffer = monoPlayback;
         src.connect(audioContextRef.current!.destination);
         sourceRef.current = src;
         src.onended = () => { setState("idle"); setAudioLevel(0); };
@@ -634,13 +537,13 @@ export default function BlackbirdConverter() {
         <button
           onClick={() => fileInputRef.current?.click()}
           className="w-10 h-10 rounded-full flex items-center justify-center active:bg-secondary transition-colors"
-          title="Upload"
+          title="Decode chirp"
         >
           <svg className="w-5 h-5 text-muted-foreground" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
           </svg>
         </button>
-        {blobUrl && state === "idle" && (
+        {blobUrl && state === "idle" && mode === "encode" && (
           <button
             onClick={copyToClipboard}
             className="w-10 h-10 rounded-full flex items-center justify-center active:bg-secondary transition-colors"
@@ -658,11 +561,11 @@ export default function BlackbirdConverter() {
             )}
           </button>
         )}
-        {processedBuffer && state === "idle" && (
+        {processedBuffer && state === "idle" && mode === "encode" && (
           <button
             onClick={handleDownload}
             className="w-10 h-10 rounded-full flex items-center justify-center active:bg-secondary transition-colors"
-            title="Download"
+            title="Download chirp"
           >
             <svg className="w-5 h-5 text-muted-foreground" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" />
