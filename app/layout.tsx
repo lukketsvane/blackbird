@@ -4,7 +4,7 @@ import "./globals.css"
 
 export const metadata: Metadata = {
   title: "Blackbird",
-  description: "Voice to birdsong converter",
+  description: "Voice to birdsong encryption",
   manifest: "/manifest.json",
   appleWebApp: {
     capable: true,
