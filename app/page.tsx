@@ -605,17 +605,9 @@ export default function BlackbirdConverter() {
       <p className="mt-6 text-sm text-muted-foreground font-medium">
         {state === "idle" && "tap to record"}
         {state === "recording" && "recording"}
-        {state === "processing" && (mode === "decode" ? "decoding" : "encoding")}
-        {state === "uploading" && "uploading"}
+        {(state === "processing" || state === "uploading") && (mode === "decode" ? "decoding" : "encoding")}
         {state === "playing" && (mode === "decode" ? "voice" : "birdsong")}
       </p>
-
-      {/* URL Display */}
-      {blobUrl && state === "idle" && (
-        <p className="mt-2 text-xs text-muted-foreground/70 max-w-xs truncate px-4 text-center">
-          {blobUrl}
-        </p>
-      )}
 
       {/* Footer */}
       <div className="absolute bottom-6 text-center safe-bottom">
