@@ -134,18 +134,31 @@ export default function BlackbirdConverter() {
     const rate = audioBuffer.sampleRate;
 
     const hilbert = createHilbertFilter(255);
+    // Bandpass around birdsong frequency range to isolate the carrier
     const birdLpf = createSincFilter(BIRD_CUTOFF, 511, rate);
-    // Use wider envelope bandwidth to preserve speech transients (150 Hz vs 50 Hz)
-    const envLpf = createSincFilter(150, 255, rate);
-    // Lighter frequency smoothing to preserve articulation
-    const freqLpf = createSincFilter(100, 127, rate);
-    // Wider output filter to keep more speech harmonics
-    const voiceSmooth = createSincFilter(3500, 127, rate);
+    // Wider envelope bandwidth to preserve speech transients
+    const envLpf = createSincFilter(200, 127, rate);
+    // Moderate frequency smoothing - enough to reduce noise but preserve articulation
+    const freqLpf = createSincFilter(80, 255, rate);
 
     const birdBand = convolve(input, birdLpf);
     const envelope = getEnvelope(birdBand, hilbert, envLpf);
     const instFreq = getInstFreq(birdBand, hilbert, rate);
-    const freqSmoothed = convolve(instFreq, freqLpf);
+    
+    // Median filter to remove frequency spikes (improves robustness)
+    const medianFiltered = new Float32Array(length);
+    const windowSize = 5;
+    for (let i = 0; i < length; i++) {
+      const samples = [];
+      for (let j = -Math.floor(windowSize / 2); j <= Math.floor(windowSize / 2); j++) {
+        const idx = Math.max(0, Math.min(length - 1, i + j));
+        samples.push(instFreq[idx]);
+      }
+      samples.sort((a, b) => a - b);
+      medianFiltered[i] = samples[Math.floor(samples.length / 2)];
+    }
+    
+    const freqSmoothed = convolve(medianFiltered, freqLpf);
 
     const output = new Float32Array(length);
     let phase = 0;
@@ -153,23 +166,33 @@ export default function BlackbirdConverter() {
     for (let i = 0; i < length; i++) {
       // Recover original voice frequency: birdFreq = BASE_FREQ + voiceFreq * FREQ_SCALE
       // Therefore: voiceFreq = (birdFreq - BASE_FREQ) / FREQ_SCALE
-      const voiceFreq = Math.max(50, Math.min(500, (freqSmoothed[i] - BASE_FREQ) / FREQ_SCALE));
+      // The encoding used instFreq (which can be negative for descending tones)
+      // so we don't strictly clamp to positive values
+      const rawVoiceFreq = (freqSmoothed[i] - BASE_FREQ) / FREQ_SCALE;
+      // Clamp to reasonable voice range but allow full speech bandwidth
+      const voiceFreq = Math.max(20, Math.min(VOICE_CUTOFF, Math.abs(rawVoiceFreq)));
       phase += (2 * Math.PI * voiceFreq) / rate;
       
-      // Generate speech-like waveform with rich harmonics for natural timbre
-      // Glottal pulse approximation with harmonics
+      // Generate glottal-like pulse with decreasing harmonics for natural voice timbre
+      // This approximates the spectral slope of natural voice (-12dB/octave)
       const h1 = Math.sin(phase);
-      const h2 = 0.5 * Math.sin(2 * phase);
-      const h3 = 0.35 * Math.sin(3 * phase);
-      const h4 = 0.25 * Math.sin(4 * phase);
-      const h5 = 0.15 * Math.sin(5 * phase);
-      const h6 = 0.1 * Math.sin(6 * phase);
-      const wave = (h1 + h2 + h3 + h4 + h5 + h6) / 2.35;
+      const h2 = 0.7 * Math.sin(2 * phase);
+      const h3 = 0.5 * Math.sin(3 * phase);
+      const h4 = 0.35 * Math.sin(4 * phase);
+      const h5 = 0.25 * Math.sin(5 * phase);
+      const h6 = 0.18 * Math.sin(6 * phase);
+      const h7 = 0.12 * Math.sin(7 * phase);
+      const h8 = 0.08 * Math.sin(8 * phase);
+      const wave = (h1 + h2 + h3 + h4 + h5 + h6 + h7 + h8) / 3.25;
       
       output[i] = wave * envelope[i];
     }
 
-    const smoothed = convolve(output, voiceSmooth);
+    // Apply formant-like emphasis - boost speech frequencies
+    // First, widen the output to include more harmonics for clarity
+    const voiceWide = createSincFilter(4000, 127, rate);
+    const smoothed = convolve(output, voiceWide);
+    
     let maxAbs = 0;
     for (let i = 0; i < length; i++) if (Math.abs(smoothed[i]) > maxAbs) maxAbs = Math.abs(smoothed[i]);
     if (maxAbs > 0) for (let i = 0; i < length; i++) smoothed[i] *= 0.9 / maxAbs;
