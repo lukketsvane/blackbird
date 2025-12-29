@@ -169,11 +169,13 @@ export function BlackbirdConverter() {
     const rate = audioBuffer.sampleRate
 
     const hilbert = createHilbertFilter(129)
-    // Wider envelope bandwidth to preserve speech transients
+    // Envelope filter: 200Hz bandwidth preserves speech transients better than narrower filters
+    // 257 taps provides good frequency resolution at this bandwidth
     const lpfEnvelope = createSincFilter(200, 257, rate)
-    // Moderate frequency smoothing - balance between noise reduction and articulation
+    // Frequency smoothing: 80Hz bandwidth balances noise reduction with articulation preservation
+    // 513 taps needed for sharper cutoff to accurately track pitch variations
     const lpfFreq = createSincFilter(80, 513, rate)
-    // Voice output filter - wide enough for clear speech
+    // Voice output filter - 4kHz includes most speech formant information
     const lpfVoice = createSincFilter(4000, 257, rate)
 
     // Create analytic signal from birdsong
@@ -192,14 +194,15 @@ export function BlackbirdConverter() {
     // Median filter to remove frequency estimation spikes
     const medianFiltered = new Float32Array(length)
     const windowSize = 5
+    const halfWindow = Math.floor(windowSize / 2)
+    const medianSamples = new Array<number>(windowSize)
     for (let i = 0; i < length; i++) {
-      const samples: number[] = []
-      for (let j = -Math.floor(windowSize / 2); j <= Math.floor(windowSize / 2); j++) {
-        const idx = Math.max(0, Math.min(length - 1, i + j))
-        samples.push(fmDemod[idx])
+      for (let j = 0; j < windowSize; j++) {
+        const idx = Math.max(0, Math.min(length - 1, i - halfWindow + j))
+        medianSamples[j] = fmDemod[idx]
       }
-      samples.sort((a, b) => a - b)
-      medianFiltered[i] = samples[Math.floor(samples.length / 2)]
+      medianSamples.sort((a, b) => a - b)
+      medianFiltered[i] = medianSamples[halfWindow]
     }
     
     // Smooth frequency to reduce noise while preserving speech variations
@@ -220,27 +223,29 @@ export function BlackbirdConverter() {
     const output = new Float32Array(length)
     let phase = 0
     
+    // Harmonic amplitudes for glottal pulse approximation (decreasing ~6dB/octave)
+    const harmonicAmps = [1.0, 0.7, 0.5, 0.35, 0.25, 0.18, 0.12, 0.08]
+    const harmonicNorm = harmonicAmps.reduce((sum, amp) => sum + amp, 0)
+    
+    // Pitch scaling factor: compensates for the encoding's narrow-band modulation extraction
+    // Encoder uses 70-140Hz bandwidth, we scale to audible voice pitch range (80-400Hz)
+    const PITCH_SCALE = 1.5
+    
     for (let i = 0; i < length; i++) {
       // Reverse the scaling to recover original voice frequency variations
       // fmFiltered[i] is in radians/sample, representing birdsong frequency
       const voicePhaseIncrement = fmFiltered[i] / (6 * FSCALE)
       
       // Scale up the phase increment to audible voice frequency range
-      // The original encoding extracted very low frequency modulation (70-140 Hz bandwidth)
-      // We need to scale this to typical voice pitch range (80-400 Hz)
-      const scaledIncrement = voicePhaseIncrement * rate * 1.5
+      const scaledIncrement = voicePhaseIncrement * rate * PITCH_SCALE
       phase += scaledIncrement
       
       // Generate glottal-like pulse with rich harmonics for natural voice timbre
-      const h1 = Math.sin(phase) * 1.0
-      const h2 = Math.sin(2 * phase) * 0.7
-      const h3 = Math.sin(3 * phase) * 0.5
-      const h4 = Math.sin(4 * phase) * 0.35
-      const h5 = Math.sin(5 * phase) * 0.25
-      const h6 = Math.sin(6 * phase) * 0.18
-      const h7 = Math.sin(7 * phase) * 0.12
-      const h8 = Math.sin(8 * phase) * 0.08
-      const wave = (h1 + h2 + h3 + h4 + h5 + h6 + h7 + h8) / 3.25
+      let wave = 0
+      for (let h = 0; h < harmonicAmps.length; h++) {
+        wave += Math.sin((h + 1) * phase) * harmonicAmps[h]
+      }
+      wave /= harmonicNorm
       
       output[i] = wave * amFiltered[i]
     }

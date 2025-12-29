@@ -136,9 +136,9 @@ export default function BlackbirdConverter() {
     const hilbert = createHilbertFilter(255);
     // Bandpass around birdsong frequency range to isolate the carrier
     const birdLpf = createSincFilter(BIRD_CUTOFF, 511, rate);
-    // Wider envelope bandwidth to preserve speech transients
+    // Envelope filter: 200Hz bandwidth preserves speech transients
     const envLpf = createSincFilter(200, 127, rate);
-    // Moderate frequency smoothing - enough to reduce noise but preserve articulation
+    // Frequency smoothing: 80Hz balances noise reduction with articulation preservation
     const freqLpf = createSincFilter(80, 255, rate);
 
     const birdBand = convolve(input, birdLpf);
@@ -148,20 +148,25 @@ export default function BlackbirdConverter() {
     // Median filter to remove frequency spikes (improves robustness)
     const medianFiltered = new Float32Array(length);
     const windowSize = 5;
+    const halfWindow = Math.floor(windowSize / 2);
+    const medianSamples = new Array<number>(windowSize);
     for (let i = 0; i < length; i++) {
-      const samples = [];
-      for (let j = -Math.floor(windowSize / 2); j <= Math.floor(windowSize / 2); j++) {
-        const idx = Math.max(0, Math.min(length - 1, i + j));
-        samples.push(instFreq[idx]);
+      for (let j = 0; j < windowSize; j++) {
+        const idx = Math.max(0, Math.min(length - 1, i - halfWindow + j));
+        medianSamples[j] = instFreq[idx];
       }
-      samples.sort((a, b) => a - b);
-      medianFiltered[i] = samples[Math.floor(samples.length / 2)];
+      medianSamples.sort((a, b) => a - b);
+      medianFiltered[i] = medianSamples[halfWindow];
     }
     
     const freqSmoothed = convolve(medianFiltered, freqLpf);
 
     const output = new Float32Array(length);
     let phase = 0;
+    
+    // Harmonic amplitudes for glottal pulse approximation (decreasing ~6dB/octave)
+    const harmonicAmps = [1.0, 0.7, 0.5, 0.35, 0.25, 0.18, 0.12, 0.08];
+    const harmonicNorm = harmonicAmps.reduce((sum, amp) => sum + amp, 0);
     
     for (let i = 0; i < length; i++) {
       // Recover original voice frequency: birdFreq = BASE_FREQ + voiceFreq * FREQ_SCALE
@@ -173,23 +178,17 @@ export default function BlackbirdConverter() {
       const voiceFreq = Math.max(20, Math.min(VOICE_CUTOFF, Math.abs(rawVoiceFreq)));
       phase += (2 * Math.PI * voiceFreq) / rate;
       
-      // Generate glottal-like pulse with decreasing harmonics for natural voice timbre
-      // This approximates the spectral slope of natural voice (-12dB/octave)
-      const h1 = Math.sin(phase);
-      const h2 = 0.7 * Math.sin(2 * phase);
-      const h3 = 0.5 * Math.sin(3 * phase);
-      const h4 = 0.35 * Math.sin(4 * phase);
-      const h5 = 0.25 * Math.sin(5 * phase);
-      const h6 = 0.18 * Math.sin(6 * phase);
-      const h7 = 0.12 * Math.sin(7 * phase);
-      const h8 = 0.08 * Math.sin(8 * phase);
-      const wave = (h1 + h2 + h3 + h4 + h5 + h6 + h7 + h8) / 3.25;
+      // Generate glottal-like pulse with rich harmonics for natural voice timbre
+      let wave = 0;
+      for (let h = 0; h < harmonicAmps.length; h++) {
+        wave += Math.sin((h + 1) * phase) * harmonicAmps[h];
+      }
+      wave /= harmonicNorm;
       
       output[i] = wave * envelope[i];
     }
 
-    // Apply formant-like emphasis - boost speech frequencies
-    // First, widen the output to include more harmonics for clarity
+    // Apply formant-like emphasis - 4kHz includes most speech formant information
     const voiceWide = createSincFilter(4000, 127, rate);
     const smoothed = convolve(output, voiceWide);
     
