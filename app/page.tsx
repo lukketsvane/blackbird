@@ -107,7 +107,7 @@ export default function BlackbirdConverter() {
     const fmI = new Float32Array(length);
     const fmQ = new Float32Array(length);
     for (let i = 0; i < length; i++) {
-      const phase = 2 * Math.PI * 0.005 * i;  // shift back by +0.005
+      const phase = 2 * Math.PI * (-SHIFT_FREQ) * i;  // shift back by -SHIFT_FREQ (i.e., +0.005)
       const cosP = Math.cos(phase);
       const sinP = Math.sin(phase);
       fmI[i] = filteredI[i] * cosP - filteredQ[i] * sinP;
@@ -185,11 +185,11 @@ export default function BlackbirdConverter() {
     const medianFiltered = new Float32Array(length);
     const windowSize = 5;
     const halfWindow = Math.floor(windowSize / 2);
+    const samples = new Array<number>(windowSize);
     for (let i = 0; i < length; i++) {
-      const samples: number[] = [];
       for (let j = 0; j < windowSize; j++) {
         const idx = Math.max(0, Math.min(length - 1, i - halfWindow + j));
-        samples.push(fmDemod[idx]);
+        samples[j] = fmDemod[idx];
       }
       samples.sort((a, b) => a - b);
       medianFiltered[i] = samples[halfWindow];
@@ -206,22 +206,22 @@ export default function BlackbirdConverter() {
     const amFiltered = convolve(amDemod, lpf70);
 
     // Reconstruct original voice
-    // Encoding: phase += (fm * 2π/rate) * FSCALE; output = sin(phase * PHASE_MULT) * am
-    // The birdsong inst_freq (in radians/sample) = fm_original * 2π/rate * FSCALE * PHASE_MULT
-    // To decode: original_fm = birdsong_inst_freq * rate / (2π * FSCALE * PHASE_MULT)
+    // Encoding: phase += (fmFiltered * 2π / rate) * FSCALE; output = sin(phase * PHASE_MULT) * am
+    // The birdsong inst_freq (in radians/sample) = (fmOriginal * 2π / rate) * FSCALE * PHASE_MULT
+    // To decode: fmOriginal = birdsong_inst_freq * rate / (2π * FSCALE * PHASE_MULT)
+    // Then reconstruct: phase += fmOriginal, output = sin(phase) * am
     const output = new Float32Array(length);
     let phase = 0;
 
     for (let i = 0; i < length; i++) {
       // Recover original phase increment
-      // fmFiltered[i] is in radians/sample (birdsong instantaneous frequency)
-      // Original: freq = (fmOriginal * 2π) / rate, then phase += freq * FSCALE, then sin(phase * PHASE_MULT)
-      // So birdsong_inst_freq = fmOriginal * 2π / rate * FSCALE * PHASE_MULT
+      // fmFiltered[i] is in radians/sample (birdsong instantaneous frequency after atan2)
+      // Encoding did: freq = (fmOriginal * 2π) / rate, phase += freq * FSCALE, sin(phase * PHASE_MULT)
+      // So birdsong_inst_freq = (fmOriginal * 2π / rate) * FSCALE * PHASE_MULT
       // Therefore: fmOriginal = fmFiltered[i] * rate / (2π * FSCALE * PHASE_MULT)
       const originalFm = fmFiltered[i] * rate / (2 * Math.PI * FSCALE * PHASE_MULT);
       
-      // The original encoding had: freq = (fmFiltered * 2π) / rate
-      // This was then phase accumulated. To reverse:
+      // Accumulate phase with the recovered FM signal
       phase += originalFm;
       
       // Generate sine wave at original frequency with original envelope
