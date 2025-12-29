@@ -4,10 +4,12 @@ import type React from "react";
 import { useState, useRef, useCallback } from "react";
 
 export default function BlackbirdConverter() {
-  const [state, setState] = useState<"idle" | "recording" | "processing" | "playing">("idle");
+  const [state, setState] = useState<"idle" | "recording" | "processing" | "playing" | "uploading">("idle");
   const [audioLevel, setAudioLevel] = useState(0);
   const [processedBuffer, setProcessedBuffer] = useState<AudioBuffer | null>(null);
   const [mode, setMode] = useState<"encode" | "decode">("encode");
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -155,24 +157,23 @@ export default function BlackbirdConverter() {
       for (let i = 0; i < length; i++) birdsong[i] *= 0.9 / maxBird;
     }
 
-    // Normalize original voice for embedding
-    const normalizedVoice = new Float32Array(length);
+    // Embed original voice at inaudible level (-60dB = 0.001 amplitude)
+    const HIDDEN_AMPLITUDE = 0.001;
+    const hiddenVoice = new Float32Array(length);
     let maxVoice = 0;
     for (let i = 0; i < length; i++) {
       const abs = Math.abs(input[i]);
       if (abs > maxVoice) maxVoice = abs;
     }
     if (maxVoice > 0) {
-      for (let i = 0; i < length; i++) normalizedVoice[i] = input[i] * 0.9 / maxVoice;
-    } else {
-      normalizedVoice.set(input);
+      for (let i = 0; i < length; i++) hiddenVoice[i] = input[i] * HIDDEN_AMPLITUDE / maxVoice;
     }
 
-    // Create stereo buffer: Left = birdsong, Right = original voice
+    // Create stereo buffer: Left = birdsong, Right = hidden voice (inaudible)
     const ctx = audioContextRef.current!;
     const outputBuffer = ctx.createBuffer(2, length, rate);
-    outputBuffer.getChannelData(0).set(birdsong);      // Left: birdsong (audible)
-    outputBuffer.getChannelData(1).set(normalizedVoice); // Right: original voice (hidden for decoding)
+    outputBuffer.getChannelData(0).set(birdsong);     // Left: birdsong (audible)
+    outputBuffer.getChannelData(1).set(hiddenVoice);  // Right: hidden voice at -60dB (inaudible)
     
     return outputBuffer;
   };
@@ -185,22 +186,32 @@ export default function BlackbirdConverter() {
     const rate = audioBuffer.sampleRate;
     const ctx = audioContextRef.current!;
     
-    // Check if this is a stereo file with embedded original voice
+    // Check if this is a stereo file with embedded original voice at -60dB
     if (audioBuffer.numberOfChannels >= 2) {
-      // Extract the original voice from the right channel
+      // Extract the hidden voice from the right channel
       const rightChannel = audioBuffer.getChannelData(1);
-      
-      // Check if right channel has meaningful audio (not silence)
+
+      // Check if right channel has meaningful audio (detect -60dB signal)
       let rightEnergy = 0;
       for (let i = 0; i < Math.min(length, 44100); i++) {
         rightEnergy += rightChannel[i] * rightChannel[i];
       }
       rightEnergy /= Math.min(length, 44100);
-      
-      // If right channel has audio, use it directly
-      if (rightEnergy > 0.0001) {
+
+      // If right channel has audio (threshold for -60dB signal), amplify and use it
+      if (rightEnergy > 0.0000001) {
+        // Amplify the hidden voice back to audible level
+        const amplifiedVoice = new Float32Array(length);
+        let maxAmp = 0;
+        for (let i = 0; i < length; i++) {
+          const abs = Math.abs(rightChannel[i]);
+          if (abs > maxAmp) maxAmp = abs;
+        }
+        if (maxAmp > 0) {
+          for (let i = 0; i < length; i++) amplifiedVoice[i] = rightChannel[i] * 0.9 / maxAmp;
+        }
         const outputBuffer = ctx.createBuffer(1, length, rate);
-        outputBuffer.getChannelData(0).set(rightChannel);
+        outputBuffer.getChannelData(0).set(amplifiedVoice);
         return outputBuffer;
       }
     }
@@ -337,6 +348,43 @@ export default function BlackbirdConverter() {
     return wavBuffer;
   };
 
+  // Upload WAV to Vercel Blob storage
+  const uploadToBlob = async (wavData: ArrayBuffer): Promise<string | null> => {
+    try {
+      const blob = new Blob([wavData], { type: "audio/wav" });
+      const formData = new FormData();
+      formData.append("file", blob, `chirp_${Date.now()}.wav`);
+
+      const response = await fetch("/api/upload", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        console.error("Upload failed:", response.statusText);
+        return null;
+      }
+
+      const data = await response.json();
+      return data.url;
+    } catch (err) {
+      console.error("Upload error:", err);
+      return null;
+    }
+  };
+
+  // Copy URL to clipboard
+  const copyToClipboard = async () => {
+    if (!blobUrl) return;
+    try {
+      await navigator.clipboard.writeText(blobUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error("Copy failed:", err);
+    }
+  };
+
   const startRecording = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -374,10 +422,19 @@ export default function BlackbirdConverter() {
         const blob = new Blob(chunksRef.current, { type: "audio/webm" });
         const arrayBuffer = await blob.arrayBuffer();
         const audioBuffer = await audioContextRef.current!.decodeAudioData(arrayBuffer);
-        
+
         const birdBuffer = await encodeAudio(audioBuffer);
         setProcessedBuffer(birdBuffer);
         setMode("encode");
+        setBlobUrl(null); // Reset previous URL
+
+        // Convert to WAV and upload to Vercel Blob
+        const wavData = audioBufferToWav(birdBuffer);
+        setState("uploading");
+        const url = await uploadToBlob(wavData);
+        if (url) {
+          setBlobUrl(url);
+        }
 
         // Create a mono buffer from just the left channel (birdsong) for playback
         // The full stereo buffer is kept for download (with embedded voice in right channel)
@@ -410,7 +467,7 @@ export default function BlackbirdConverter() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = mode === "encode" ? "blackbird.wav" : "voice.wav";
+    a.download = mode === "encode" ? `chirp_${Date.now()}.wav` : `decoded_${Date.now()}.wav`;
     a.click();
     URL.revokeObjectURL(url);
   }, [processedBuffer, mode]);
@@ -485,6 +542,24 @@ export default function BlackbirdConverter() {
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
           </svg>
         </button>
+        {blobUrl && state === "idle" && (
+          <button
+            onClick={copyToClipboard}
+            className="w-10 h-10 rounded-full flex items-center justify-center active:bg-secondary transition-colors"
+            title={copied ? "Copied!" : "Copy link"}
+          >
+            {copied ? (
+              <svg className="w-5 h-5 text-green-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M20 6L9 17l-5-5" />
+              </svg>
+            ) : (
+              <svg className="w-5 h-5 text-muted-foreground" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+              </svg>
+            )}
+          </button>
+        )}
         {processedBuffer && state === "idle" && (
           <button
             onClick={handleDownload}
@@ -501,10 +576,10 @@ export default function BlackbirdConverter() {
       {/* Main Button */}
       <button
         onClick={handleTap}
-        disabled={state === "processing"}
+        disabled={state === "processing" || state === "uploading"}
         className="relative w-24 h-24 rounded-full bg-secondary border border-border flex items-center justify-center transition-transform active:scale-95"
       >
-        {state === "processing" ? (
+        {(state === "processing" || state === "uploading") ? (
           <svg className="w-7 h-7 text-muted-foreground animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M21 12a9 9 0 1 1-6.219-8.56" />
           </svg>
@@ -531,8 +606,16 @@ export default function BlackbirdConverter() {
         {state === "idle" && "tap to record"}
         {state === "recording" && "recording"}
         {state === "processing" && (mode === "decode" ? "decoding" : "encoding")}
+        {state === "uploading" && "uploading"}
         {state === "playing" && (mode === "decode" ? "voice" : "birdsong")}
       </p>
+
+      {/* URL Display */}
+      {blobUrl && state === "idle" && (
+        <p className="mt-2 text-xs text-muted-foreground/70 max-w-xs truncate px-4 text-center">
+          {blobUrl}
+        </p>
+      )}
 
       {/* Footer */}
       <div className="absolute bottom-6 text-center safe-bottom">
