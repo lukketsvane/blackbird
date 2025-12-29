@@ -266,15 +266,15 @@ export function BlackbirdConverter() {
 
     let maxAbs = 0
     for (let i = 0; i < length; i++) {
-      const abs = Math.abs(smoothed[i])
+      const abs = Math.abs(output[i])
       if (abs > maxAbs) maxAbs = abs
     }
     if (maxAbs > 0) {
-      for (let i = 0; i < length; i++) smoothed[i] *= 0.9 / maxAbs
+      for (let i = 0; i < length; i++) output[i] *= 0.9 / maxAbs
     }
 
     const outputBuffer = ctx.createBuffer(1, length, rate)
-    outputBuffer.getChannelData(0).set(smoothed)
+    outputBuffer.getChannelData(0).set(output)
     return outputBuffer
   }
 
