@@ -157,24 +157,25 @@ export function BlackbirdConverter() {
       for (let i = 0; i < length; i++) birdsong[i] *= 0.9 / maxBird
     }
 
-    // Normalize original voice for embedding
-    const normalizedVoice = new Float32Array(length)
+    // Normalize original voice for hidden embedding at inaudible level
+    const HIDDEN_AMPLITUDE = 0.001 // -60dB, inaudible but reconstructable
+    const hiddenVoice = new Float32Array(length)
     let maxVoice = 0
     for (let i = 0; i < length; i++) {
       const abs = Math.abs(input[i])
       if (abs > maxVoice) maxVoice = abs
     }
     if (maxVoice > 0) {
-      for (let i = 0; i < length; i++) normalizedVoice[i] = input[i] * 0.9 / maxVoice
+      for (let i = 0; i < length; i++) hiddenVoice[i] = input[i] * HIDDEN_AMPLITUDE / maxVoice
     } else {
-      normalizedVoice.set(input)
+      for (let i = 0; i < length; i++) hiddenVoice[i] = input[i] * HIDDEN_AMPLITUDE
     }
 
-    // Create stereo buffer: Left = birdsong, Right = original voice
+    // Create stereo buffer: Left = birdsong, Right = hidden original voice (inaudible)
     const ctx = audioContextRef.current!
     const outputBuffer = ctx.createBuffer(2, length, rate)
     outputBuffer.getChannelData(0).set(birdsong)
-    outputBuffer.getChannelData(1).set(normalizedVoice)
+    outputBuffer.getChannelData(1).set(hiddenVoice)
     return outputBuffer
   }
 
@@ -183,20 +184,39 @@ export function BlackbirdConverter() {
     const rate = audioBuffer.sampleRate
     const ctx = audioContextRef.current!
     
-    // Check if this is a stereo file with embedded original voice
+    // Check if this is a stereo file with hidden embedded original voice
     if (audioBuffer.numberOfChannels >= 2) {
       const rightChannel = audioBuffer.getChannelData(1)
       
-      // Check if right channel has meaningful audio
+      // Check if right channel has any audio (even at very low amplitude)
       let rightEnergy = 0
       for (let i = 0; i < Math.min(length, 44100); i++) {
         rightEnergy += rightChannel[i] * rightChannel[i]
       }
       rightEnergy /= Math.min(length, 44100)
       
-      if (rightEnergy > 0.0001) {
+      // Lower threshold to detect hidden audio (embedded at ~0.001 amplitude)
+      if (rightEnergy > 0.0000001) {
+        // Find max amplitude and normalize to audible level
+        let maxAmp = 0
+        for (let i = 0; i < length; i++) {
+          const abs = Math.abs(rightChannel[i])
+          if (abs > maxAmp) maxAmp = abs
+        }
+        
         const outputBuffer = ctx.createBuffer(1, length, rate)
-        outputBuffer.getChannelData(0).set(rightChannel)
+        const outputData = outputBuffer.getChannelData(0)
+        
+        // Amplify the hidden voice back to audible level (0.9 peak)
+        if (maxAmp > 0) {
+          const gain = 0.9 / maxAmp
+          for (let i = 0; i < length; i++) {
+            outputData[i] = rightChannel[i] * gain
+          }
+        } else {
+          outputData.set(rightChannel)
+        }
+        
         return outputBuffer
       }
     }
@@ -537,7 +557,7 @@ export function BlackbirdConverter() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement("a")
     a.href = url
-    a.download = mode === "encode" ? "chirp.wav" : "decoded.wav"
+    a.download = mode === "encode" ? `chirp_${Date.now()}.wav` : `decoded_${Date.now()}.wav`
     a.click()
     URL.revokeObjectURL(url)
   }, [processedBuffer, mode])
