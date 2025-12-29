@@ -535,7 +535,7 @@ export function BlackbirdConverter() {
       </div>
 
       <div className="absolute top-4 right-4 flex items-center gap-2">
-        <input ref={fileInputRef} type="file" accept="audio/*" onChange={handleFileSelect} className="hidden" />
+        <input ref={fileInputRef} type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.webm" onChange={handleFileSelect} className="hidden" />
         <button
           onClick={() => fileInputRef.current?.click()}
           className="p-2 rounded-full hover:bg-secondary transition-colors"
