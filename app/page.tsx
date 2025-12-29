@@ -135,24 +135,38 @@ export default function BlackbirdConverter() {
 
     const hilbert = createHilbertFilter(255);
     const birdLpf = createSincFilter(BIRD_CUTOFF, 511, rate);
-    const envLpf = createSincFilter(50, 255, rate);
-    const voiceSmooth = createSincFilter(VOICE_CUTOFF, 255, rate);
+    // Use wider envelope bandwidth to preserve speech transients (150 Hz vs 50 Hz)
+    const envLpf = createSincFilter(150, 255, rate);
+    // Lighter frequency smoothing to preserve articulation
+    const freqLpf = createSincFilter(100, 127, rate);
+    // Wider output filter to keep more speech harmonics
+    const voiceSmooth = createSincFilter(3500, 127, rate);
 
     const birdBand = convolve(input, birdLpf);
     const envelope = getEnvelope(birdBand, hilbert, envLpf);
     const instFreq = getInstFreq(birdBand, hilbert, rate);
-    const freqSmoothed = convolve(instFreq, envLpf);
+    const freqSmoothed = convolve(instFreq, freqLpf);
 
     const output = new Float32Array(length);
     let phase = 0;
     
     for (let i = 0; i < length; i++) {
-      const modulation = (freqSmoothed[i] - BASE_FREQ) / FREQ_SCALE;
-      const voiceFreq = Math.max(80, Math.min(400, 150 + modulation));
+      // Recover original voice frequency: birdFreq = BASE_FREQ + voiceFreq * FREQ_SCALE
+      // Therefore: voiceFreq = (birdFreq - BASE_FREQ) / FREQ_SCALE
+      const voiceFreq = Math.max(50, Math.min(500, (freqSmoothed[i] - BASE_FREQ) / FREQ_SCALE));
       phase += (2 * Math.PI * voiceFreq) / rate;
-      const saw = ((phase % (2 * Math.PI)) / Math.PI) - 1;
-      const sine = Math.sin(phase);
-      output[i] = (0.7 * sine + 0.3 * saw) * envelope[i];
+      
+      // Generate speech-like waveform with rich harmonics for natural timbre
+      // Glottal pulse approximation with harmonics
+      const h1 = Math.sin(phase);
+      const h2 = 0.5 * Math.sin(2 * phase);
+      const h3 = 0.35 * Math.sin(3 * phase);
+      const h4 = 0.25 * Math.sin(4 * phase);
+      const h5 = 0.15 * Math.sin(5 * phase);
+      const h6 = 0.1 * Math.sin(6 * phase);
+      const wave = (h1 + h2 + h3 + h4 + h5 + h6) / 2.35;
+      
+      output[i] = wave * envelope[i];
     }
 
     const smoothed = convolve(output, voiceSmooth);
