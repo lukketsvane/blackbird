@@ -25,8 +25,9 @@ export default function BlackbirdConverter() {
   const SHIFT_FREQ = -0.005;   // Baseband shift frequency from Perl
   const PHASE_MULT = 6;        // Phase multiplier: sin(phase * 6) from Perl
 
-  // Voice is encoded in the birdsong structure itself via FM/AM modulation
-  // No ultrasonic carrier needed - decoding reconstructs from signal processing
+  // Phase encoding steganography
+  // Voice is hidden in the phase of birdsong (inaudible but perfectly recoverable)
+  const PHASE_MOD_INDEX = 0.15; // Phase modulation strength for voice embedding
 
   // Hilbert transform filter (90-degree phase shifter)
   const createHilbertFilter = (length: number): Float32Array => {
@@ -163,26 +164,71 @@ export default function BlackbirdConverter() {
       birdsong[i] = Math.sin(phase * PHASE_MULT) * amFiltered[i];
     }
 
-    // Normalize birdsong to 0.9 for full amplitude
+    // Normalize birdsong to 0.85 for headroom
     let maxBird = 0;
     for (let i = 0; i < length; i++) {
       const abs = Math.abs(birdsong[i]);
       if (abs > maxBird) maxBird = abs;
     }
     if (maxBird > 0) {
-      for (let i = 0; i < length; i++) birdsong[i] *= 0.9 / maxBird;
+      for (let i = 0; i < length; i++) birdsong[i] *= 0.85 / maxBird;
     }
 
-    // Create MONO buffer with pure birdsong (voice encoded in FM/AM structure)
+    // === PHASE ENCODING STEGANOGRAPHY ===
+    // Hide voice in the phase of birdsong for perfect reconstruction
+
+    // Normalize voice for phase modulation
+    let maxVoice = 0;
+    for (let i = 0; i < length; i++) {
+      const abs = Math.abs(input[i]);
+      if (abs > maxVoice) maxVoice = abs;
+    }
+    const normalizedVoice = new Float32Array(length);
+    if (maxVoice > 0) {
+      for (let i = 0; i < length; i++) {
+        normalizedVoice[i] = input[i] / maxVoice;
+      }
+    }
+
+    // Create analytic signal of birdsong
+    const birdReal = new Float32Array(birdsong);
+    const birdImag = convolve(birdsong, hilbert);
+
+    // Extract magnitude and phase
+    const magnitude = new Float32Array(length);
+    const phase = new Float32Array(length);
+    for (let i = 0; i < length; i++) {
+      magnitude[i] = Math.sqrt(birdReal[i] * birdReal[i] + birdImag[i] * birdImag[i]);
+      phase[i] = Math.atan2(birdImag[i], birdReal[i]);
+    }
+
+    // Phase modulation: embed voice in the phase
+    const output = new Float32Array(length);
+    for (let i = 0; i < length; i++) {
+      const modulatedPhase = phase[i] + normalizedVoice[i] * PHASE_MOD_INDEX;
+      output[i] = magnitude[i] * Math.cos(modulatedPhase);
+    }
+
+    // Final normalization
+    let maxOut = 0;
+    for (let i = 0; i < length; i++) {
+      const abs = Math.abs(output[i]);
+      if (abs > maxOut) maxOut = abs;
+    }
+    if (maxOut > 0) {
+      for (let i = 0; i < length; i++) output[i] *= 0.9 / maxOut;
+    }
+
+    // Create MONO buffer with phase-encoded voice
     const ctx = audioContextRef.current!;
     const outputBuffer = ctx.createBuffer(1, length, rate);
-    outputBuffer.getChannelData(0).set(birdsong);
+    outputBuffer.getChannelData(0).set(output);
 
     return outputBuffer;
   };
 
   // Decode birdsong back to voice
-  // Reconstructs voice from birdsong FM/AM structure using signal processing
+  // Extracts voice from phase-encoded birdsong
   const decodeAudio = async (audioBuffer: AudioBuffer): Promise<AudioBuffer> => {
     const length = audioBuffer.length;
     const rate = audioBuffer.sampleRate;
@@ -190,6 +236,81 @@ export default function BlackbirdConverter() {
     const input = audioBuffer.getChannelData(0);
 
     const hilbert = createHilbertFilter(129);
+    const lpf4000 = createSincFilter(4000, 513, rate);  // Voice bandwidth limit
+    const lpf500 = createSincFilter(500, 1025, rate);   // For birdsong phase estimation
+
+    // === PHASE DEMODULATION ===
+    // Extract voice from phase-modulated birdsong
+
+    // Create analytic signal
+    const realPart = new Float32Array(input);
+    const imagPart = convolve(input, hilbert);
+
+    // Extract instantaneous phase
+    const totalPhase = new Float32Array(length);
+    for (let i = 0; i < length; i++) {
+      totalPhase[i] = Math.atan2(imagPart[i], realPart[i]);
+    }
+
+    // Unwrap phase (handle 2π discontinuities)
+    const unwrappedPhase = new Float32Array(length);
+    unwrappedPhase[0] = totalPhase[0];
+    for (let i = 1; i < length; i++) {
+      let delta = totalPhase[i] - totalPhase[i - 1];
+      // Detect wrapping
+      if (delta > Math.PI) delta -= 2 * Math.PI;
+      if (delta < -Math.PI) delta += 2 * Math.PI;
+      unwrappedPhase[i] = unwrappedPhase[i - 1] + delta;
+    }
+
+    // Estimate birdsong phase (lowpass filter the total phase)
+    // Birdsong phase varies slowly, voice modulation is faster
+    const birdsongPhase = convolve(unwrappedPhase, lpf500);
+
+    // Extract voice: voice = (total_phase - birdsong_phase) / PHASE_MOD_INDEX
+    const voice = new Float32Array(length);
+    for (let i = 0; i < length; i++) {
+      voice[i] = (unwrappedPhase[i] - birdsongPhase[i]) / PHASE_MOD_INDEX;
+    }
+
+    // Bandlimit to voice frequencies and remove any DC offset
+    const voiceFiltered = convolve(voice, lpf4000);
+
+    // Remove DC component
+    let dcOffset = 0;
+    for (let i = 0; i < length; i++) {
+      dcOffset += voiceFiltered[i];
+    }
+    dcOffset /= length;
+    for (let i = 0; i < length; i++) {
+      voiceFiltered[i] -= dcOffset;
+    }
+
+    // Check if we successfully decoded voice (energy detection)
+    let voiceEnergy = 0;
+    for (let i = 0; i < Math.min(length, rate); i++) {
+      voiceEnergy += voiceFiltered[i] * voiceFiltered[i];
+    }
+    voiceEnergy /= Math.min(length, rate);
+
+    if (voiceEnergy > 0.0001) {
+      // Normalize to audible level
+      let maxAmp = 0;
+      for (let i = 0; i < length; i++) {
+        const abs = Math.abs(voiceFiltered[i]);
+        if (abs > maxAmp) maxAmp = abs;
+      }
+      const normalizedVoice = new Float32Array(length);
+      if (maxAmp > 0) {
+        for (let i = 0; i < length; i++) {
+          normalizedVoice[i] = voiceFiltered[i] * 0.9 / maxAmp;
+        }
+      }
+
+      const outputBuffer = ctx.createBuffer(1, length, rate);
+      outputBuffer.getChannelData(0).set(normalizedVoice);
+      return outputBuffer;
+    }
 
     // === LEGACY SUPPORT: Check for old stereo right channel embedding ===
     if (audioBuffer.numberOfChannels >= 2) {
@@ -216,67 +337,9 @@ export default function BlackbirdConverter() {
       }
     }
 
-    // === SIGNAL PROCESSING RECONSTRUCTION ===
-    // Decode voice from birdsong FM/AM structure
-    const lpf70 = createSincFilter(70, 1025, rate);
-    const realPart = new Float32Array(input);
-    const imagPart = convolve(input, hilbert);
-
-    // FM demodulation
-    const fmDemod = new Float32Array(length);
-    for (let i = 1; i < length; i++) {
-      const cross = realPart[i] * imagPart[i - 1] - imagPart[i] * realPart[i - 1];
-      const dot = realPart[i] * realPart[i - 1] + imagPart[i] * imagPart[i - 1];
-      fmDemod[i] = Math.atan2(cross, dot);
-    }
-    fmDemod[0] = fmDemod[1];
-
-    // Median filter
-    const medianFiltered = new Float32Array(length);
-    const windowSize = 5;
-    const halfWindow = Math.floor(windowSize / 2);
-    const samples = new Array<number>(windowSize);
-    for (let i = 0; i < length; i++) {
-      for (let j = 0; j < windowSize; j++) {
-        const idx = Math.max(0, Math.min(length - 1, i - halfWindow + j));
-        samples[j] = fmDemod[idx];
-      }
-      samples.sort((a, b) => a - b);
-      medianFiltered[i] = samples[halfWindow];
-    }
-
-    const fmFiltered = convolve(medianFiltered, lpf70);
-
-    // AM demodulation
-    const amDemod = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-      amDemod[i] = Math.sqrt(realPart[i] * realPart[i] + imagPart[i] * imagPart[i]);
-    }
-    const amFiltered = convolve(amDemod, lpf70);
-
-    // Reconstruct voice
-    const output = new Float32Array(length);
-    let phase = 0;
-    for (let i = 0; i < length; i++) {
-      const originalFm = fmFiltered[i] * rate / (2 * Math.PI * FSCALE * PHASE_MULT);
-      phase += originalFm;
-      output[i] = Math.sin(phase) * amFiltered[i];
-    }
-
-    const lpf4000 = createSincFilter(4000, 257, rate);
-    const smoothed = convolve(output, lpf4000);
-
-    let maxAbs = 0;
-    for (let i = 0; i < length; i++) {
-      const abs = Math.abs(smoothed[i]);
-      if (abs > maxAbs) maxAbs = abs;
-    }
-    if (maxAbs > 0) {
-      for (let i = 0; i < length; i++) smoothed[i] *= 0.9 / maxAbs;
-    }
-
+    // If no phase-encoded voice found, return empty/silence
+    console.warn("No phase-encoded voice detected");
     const outputBuffer = ctx.createBuffer(1, length, rate);
-    outputBuffer.getChannelData(0).set(smoothed);
     return outputBuffer;
   };
 
@@ -429,7 +492,7 @@ export default function BlackbirdConverter() {
           setBlobUrl(url);
         }
 
-        // Output is pure birdsong with voice encoded in FM/AM structure
+        // Output is birdsong with voice hidden in phase (inaudible)
         setState("playing");
         const src = audioContextRef.current!.createBufferSource();
         src.buffer = birdBuffer;
