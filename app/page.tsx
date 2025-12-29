@@ -1,18 +1,21 @@
+"use client";
+
+import type React from "react";
 import { useState, useRef, useCallback } from "react";
 
 export default function BlackbirdConverter() {
-  const [state, setState] = useState("idle");
+  const [state, setState] = useState<"idle" | "recording" | "processing" | "playing">("idle");
   const [audioLevel, setAudioLevel] = useState(0);
-  const [processedBuffer, setProcessedBuffer] = useState(null);
-  const [mode, setMode] = useState("encode");
-  const audioContextRef = useRef(null);
-  const mediaRecorderRef = useRef(null);
-  const chunksRef = useRef([]);
-  const sourceRef = useRef(null);
-  const analyserRef = useRef(null);
-  const animationRef = useRef(0);
-  const lastTapRef = useRef(0);
-  const fileInputRef = useRef(null);
+  const [processedBuffer, setProcessedBuffer] = useState<AudioBuffer | null>(null);
+  const [mode, setMode] = useState<"encode" | "decode">("encode");
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animationRef = useRef<number>(0);
+  const lastTapRef = useRef<number>(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const SAMPLE_RATE = 44100;
   const FREQ_SCALE = 20;
@@ -20,7 +23,7 @@ export default function BlackbirdConverter() {
   const BIRD_CUTOFF = 8000;
   const BASE_FREQ = 3000;
 
-  const createHilbertFilter = (length) => {
+  const createHilbertFilter = (length: number): Float32Array => {
     const filter = new Float32Array(length);
     const mid = Math.floor(length / 2);
     for (let i = 0; i < length; i++) {
@@ -33,7 +36,7 @@ export default function BlackbirdConverter() {
     return filter;
   };
 
-  const createSincFilter = (cutoffHz, length, sampleRate) => {
+  const createSincFilter = (cutoffHz: number, length: number, sampleRate: number): Float32Array => {
     const filter = new Float32Array(length);
     const mid = Math.floor(length / 2);
     const fc = cutoffHz / sampleRate;
@@ -50,7 +53,7 @@ export default function BlackbirdConverter() {
     return filter;
   };
 
-  const convolve = (signal, filter) => {
+  const convolve = (signal: Float32Array, filter: Float32Array): Float32Array => {
     const result = new Float32Array(signal.length);
     const filterLen = filter.length;
     const mid = Math.floor(filterLen / 2);
@@ -65,7 +68,7 @@ export default function BlackbirdConverter() {
     return result;
   };
 
-  const getEnvelope = (signal, hilbert, lpf) => {
+  const getEnvelope = (signal: Float32Array, hilbert: Float32Array, lpf: Float32Array): Float32Array => {
     const imag = convolve(signal, hilbert);
     const envelope = new Float32Array(signal.length);
     for (let i = 0; i < signal.length; i++) {
@@ -74,7 +77,7 @@ export default function BlackbirdConverter() {
     return convolve(envelope, lpf);
   };
 
-  const getInstFreq = (signal, hilbert, rate) => {
+  const getInstFreq = (signal: Float32Array, hilbert: Float32Array, rate: number): Float32Array => {
     const imag = convolve(signal, hilbert);
     const freq = new Float32Array(signal.length);
     for (let i = 1; i < signal.length; i++) {
@@ -88,7 +91,7 @@ export default function BlackbirdConverter() {
     return freq;
   };
 
-  const encodeAudio = async (audioBuffer) => {
+  const encodeAudio = async (audioBuffer: AudioBuffer): Promise<AudioBuffer> => {
     const input = audioBuffer.getChannelData(0);
     const length = input.length;
     const rate = audioBuffer.sampleRate;
@@ -119,13 +122,13 @@ export default function BlackbirdConverter() {
     for (let i = 0; i < length; i++) if (Math.abs(output[i]) > maxAbs) maxAbs = Math.abs(output[i]);
     if (maxAbs > 0) for (let i = 0; i < length; i++) output[i] *= 0.9 / maxAbs;
 
-    const ctx = audioContextRef.current;
+    const ctx = audioContextRef.current!;
     const outputBuffer = ctx.createBuffer(1, length, rate);
     outputBuffer.getChannelData(0).set(output);
     return outputBuffer;
   };
 
-  const decodeAudio = async (audioBuffer) => {
+  const decodeAudio = async (audioBuffer: AudioBuffer): Promise<AudioBuffer> => {
     const input = audioBuffer.getChannelData(0);
     const length = input.length;
     const rate = audioBuffer.sampleRate;
@@ -157,17 +160,17 @@ export default function BlackbirdConverter() {
     for (let i = 0; i < length; i++) if (Math.abs(smoothed[i]) > maxAbs) maxAbs = Math.abs(smoothed[i]);
     if (maxAbs > 0) for (let i = 0; i < length; i++) smoothed[i] *= 0.9 / maxAbs;
 
-    const ctx = audioContextRef.current;
+    const ctx = audioContextRef.current!;
     const outputBuffer = ctx.createBuffer(1, length, rate);
     outputBuffer.getChannelData(0).set(smoothed);
     return outputBuffer;
   };
 
-  const audioBufferToWav = (buffer) => {
+  const audioBufferToWav = (buffer: AudioBuffer): ArrayBuffer => {
     const samples = buffer.getChannelData(0);
     const wavBuffer = new ArrayBuffer(44 + samples.length * 2);
     const view = new DataView(wavBuffer);
-    const writeString = (offset, string) => {
+    const writeString = (offset: number, string: string) => {
       for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i));
     };
     writeString(0, "RIFF");
@@ -228,15 +231,15 @@ export default function BlackbirdConverter() {
 
         const blob = new Blob(chunksRef.current, { type: "audio/webm" });
         const arrayBuffer = await blob.arrayBuffer();
-        const audioBuffer = await audioContextRef.current.decodeAudioData(arrayBuffer);
+        const audioBuffer = await audioContextRef.current!.decodeAudioData(arrayBuffer);
         const birdBuffer = await encodeAudio(audioBuffer);
         setProcessedBuffer(birdBuffer);
         setMode("encode");
 
         setState("playing");
-        const src = audioContextRef.current.createBufferSource();
+        const src = audioContextRef.current!.createBufferSource();
         src.buffer = birdBuffer;
-        src.connect(audioContextRef.current.destination);
+        src.connect(audioContextRef.current!.destination);
         sourceRef.current = src;
         src.onended = () => { setState("idle"); setAudioLevel(0); };
         src.start();
@@ -264,7 +267,7 @@ export default function BlackbirdConverter() {
     URL.revokeObjectURL(url);
   }, [processedBuffer, mode]);
 
-  const handleFileSelect = useCallback(async (e) => {
+  const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     e.target.value = "";
