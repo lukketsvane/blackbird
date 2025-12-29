@@ -25,11 +25,8 @@ export default function BlackbirdConverter() {
   const SHIFT_FREQ = -0.005;   // Baseband shift frequency from Perl
   const PHASE_MULT = 6;        // Phase multiplier: sin(phase * 6) from Perl
 
-  // Ultrasonic steganography constants
-  // Voice is modulated onto ultrasonic carrier (inaudible to humans)
-  // and mixed into the mono birdsong output
-  const ULTRASONIC_CARRIER = 19000;  // 19kHz carrier (above human hearing)
-  const ULTRASONIC_AMPLITUDE = 0.25; // Amplitude for embedded voice (strong enough for recovery)
+  // Voice is encoded in the birdsong structure itself via FM/AM modulation
+  // No ultrasonic carrier needed - decoding reconstructs from signal processing
 
   // Hilbert transform filter (90-degree phase shifter)
   const createHilbertFilter = (length: number): Float32Array => {
@@ -98,8 +95,8 @@ export default function BlackbirdConverter() {
     return result;
   };
 
-  // Encode voice to birdsong with ultrasonic steganographic embedding
-  // Voice is modulated onto 19kHz carrier (inaudible) and mixed into mono output
+  // Encode voice to birdsong
+  // Voice information is encoded in the birdsong's FM/AM structure
   const encodeAudio = async (audioBuffer: AudioBuffer): Promise<AudioBuffer> => {
     const input = audioBuffer.getChannelData(0);
     const length = input.length;
@@ -108,7 +105,6 @@ export default function BlackbirdConverter() {
     const hilbert = createHilbertFilter(129);
     const lpf140 = createSincFilter(140, 1025, rate);
     const lpf70 = createSincFilter(70, 1025, rate);
-    const lpfVoice = createSincFilter(3500, 513, rate); // Limit voice to 3.5kHz for ultrasonic band
 
     // Create analytic signal (real + j*hilbert)
     const realPart = new Float32Array(input);
@@ -167,141 +163,35 @@ export default function BlackbirdConverter() {
       birdsong[i] = Math.sin(phase * PHASE_MULT) * amFiltered[i];
     }
 
-    // Normalize birdsong to 0.7 to leave headroom for ultrasonic embedding
+    // Normalize birdsong to 0.9 for full amplitude
     let maxBird = 0;
     for (let i = 0; i < length; i++) {
       const abs = Math.abs(birdsong[i]);
       if (abs > maxBird) maxBird = abs;
     }
     if (maxBird > 0) {
-      for (let i = 0; i < length; i++) birdsong[i] *= 0.7 / maxBird;
+      for (let i = 0; i < length; i++) birdsong[i] *= 0.9 / maxBird;
     }
 
-    // === ULTRASONIC STEGANOGRAPHY ===
-    // Bandlimit original voice to 3.5kHz for ultrasonic embedding
-    const bandlimitedVoice = convolve(input, lpfVoice);
-
-    // Normalize the bandlimited voice
-    let maxVoice = 0;
-    for (let i = 0; i < length; i++) {
-      const abs = Math.abs(bandlimitedVoice[i]);
-      if (abs > maxVoice) maxVoice = abs;
-    }
-    const normalizedVoice = new Float32Array(length);
-    if (maxVoice > 0) {
-      for (let i = 0; i < length; i++) {
-        normalizedVoice[i] = bandlimitedVoice[i] / maxVoice;
-      }
-    }
-
-    // AM modulate voice onto ultrasonic carrier (19kHz)
-    // Using Double Sideband Suppressed Carrier (DSB-SC) for efficiency
-    const ultrasonicOmega = 2 * Math.PI * ULTRASONIC_CARRIER / rate;
-    const modulatedUltrasonic = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-      // DSB-SC modulation: voice * cos(carrier)
-      modulatedUltrasonic[i] = normalizedVoice[i] * Math.cos(ultrasonicOmega * i) * ULTRASONIC_AMPLITUDE;
-    }
-
-    // Combine birdsong with ultrasonic embedded voice
-    const output = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-      output[i] = birdsong[i] + modulatedUltrasonic[i];
-    }
-
-    // Final limiting to prevent clipping
-    let maxOut = 0;
-    for (let i = 0; i < length; i++) {
-      const abs = Math.abs(output[i]);
-      if (abs > maxOut) maxOut = abs;
-    }
-    if (maxOut > 0.95) {
-      const scale = 0.95 / maxOut;
-      for (let i = 0; i < length; i++) output[i] *= scale;
-    }
-
-    // Create MONO buffer (no stereo channel leakage)
+    // Create MONO buffer with pure birdsong (voice encoded in FM/AM structure)
     const ctx = audioContextRef.current!;
     const outputBuffer = ctx.createBuffer(1, length, rate);
-    outputBuffer.getChannelData(0).set(output);
+    outputBuffer.getChannelData(0).set(birdsong);
 
     return outputBuffer;
   };
 
   // Decode birdsong back to voice
-  // Extracts voice from ultrasonic band (19kHz carrier) using coherent demodulation
+  // Reconstructs voice from birdsong FM/AM structure using signal processing
   const decodeAudio = async (audioBuffer: AudioBuffer): Promise<AudioBuffer> => {
     const length = audioBuffer.length;
     const rate = audioBuffer.sampleRate;
     const ctx = audioContextRef.current!;
     const input = audioBuffer.getChannelData(0);
 
-    // Create filters for ultrasonic extraction
-    const lpfDemod = createSincFilter(4000, 513, rate);  // Post-demodulation filter
     const hilbert = createHilbertFilter(129);
 
-    // === ULTRASONIC DEMODULATION ===
-    // Coherent demodulation: multiply by carrier and lowpass filter
-    const ultrasonicOmega = 2 * Math.PI * ULTRASONIC_CARRIER / rate;
-
-    // Demodulate with in-phase carrier (I channel)
-    const demodI = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-      demodI[i] = input[i] * Math.cos(ultrasonicOmega * i) * 2; // *2 to recover amplitude
-    }
-
-    // Demodulate with quadrature carrier (Q channel) for envelope detection
-    const demodQ = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-      demodQ[i] = input[i] * Math.sin(ultrasonicOmega * i) * 2;
-    }
-
-    // Lowpass filter both channels to remove 2*carrier frequency component
-    const filteredI = convolve(demodI, lpfDemod);
-    const filteredQ = convolve(demodQ, lpfDemod);
-
-    // Compute envelope (magnitude of I/Q) for robust recovery
-    // This handles any phase offset in the carrier
-    const envelope = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-      envelope[i] = Math.sqrt(filteredI[i] * filteredI[i] + filteredQ[i] * filteredQ[i]);
-    }
-
-    // Check if ultrasonic content is present (energy detection)
-    let ultrasonicEnergy = 0;
-    for (let i = 0; i < Math.min(length, rate); i++) {
-      ultrasonicEnergy += envelope[i] * envelope[i];
-    }
-    ultrasonicEnergy /= Math.min(length, rate);
-
-    // If ultrasonic voice is detected, use it
-    if (ultrasonicEnergy > 0.0001) {
-      // The demodulated signal preserves the original waveform polarity
-      // Use I channel directly since our encoding used cos() carrier
-      const voice = new Float32Array(length);
-
-      // Apply additional smoothing
-      const lpfSmooth = createSincFilter(3500, 257, rate);
-      const smoothed = convolve(filteredI, lpfSmooth);
-
-      // Normalize to audible level
-      let maxAmp = 0;
-      for (let i = 0; i < length; i++) {
-        const abs = Math.abs(smoothed[i]);
-        if (abs > maxAmp) maxAmp = abs;
-      }
-      if (maxAmp > 0) {
-        for (let i = 0; i < length; i++) {
-          voice[i] = smoothed[i] * 0.9 / maxAmp;
-        }
-      }
-
-      const outputBuffer = ctx.createBuffer(1, length, rate);
-      outputBuffer.getChannelData(0).set(voice);
-      return outputBuffer;
-    }
-
-    // === LEGACY SUPPORT: Check for stereo right channel ===
+    // === LEGACY SUPPORT: Check for old stereo right channel embedding ===
     if (audioBuffer.numberOfChannels >= 2) {
       const rightChannel = audioBuffer.getChannelData(1);
       let rightEnergy = 0;
@@ -326,7 +216,8 @@ export default function BlackbirdConverter() {
       }
     }
 
-    // === FALLBACK: Signal processing reconstruction ===
+    // === SIGNAL PROCESSING RECONSTRUCTION ===
+    // Decode voice from birdsong FM/AM structure
     const lpf70 = createSincFilter(70, 1025, rate);
     const realPart = new Float32Array(input);
     const imagPart = convolve(input, hilbert);
@@ -538,7 +429,7 @@ export default function BlackbirdConverter() {
           setBlobUrl(url);
         }
 
-        // Output is already mono with ultrasonic embedded voice (inaudible to humans)
+        // Output is pure birdsong with voice encoded in FM/AM structure
         setState("playing");
         const src = audioContextRef.current!.createBufferSource();
         src.buffer = birdBuffer;
