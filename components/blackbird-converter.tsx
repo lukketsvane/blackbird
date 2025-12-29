@@ -169,14 +169,8 @@ export function BlackbirdConverter() {
     const rate = audioBuffer.sampleRate
 
     const hilbert = createHilbertFilter(129)
-    // Envelope filter: 200Hz bandwidth preserves speech transients better than narrower filters
-    // 257 taps provides good frequency resolution at this bandwidth
     const lpfEnvelope = createSincFilter(200, 257, rate)
-    // Frequency smoothing: 80Hz bandwidth balances noise reduction with articulation preservation
-    // 513 taps needed for sharper cutoff to accurately track pitch variations
-    const lpfFreq = createSincFilter(80, 513, rate)
-    // Voice output filter - 4kHz includes most speech formant information
-    const lpfVoice = createSincFilter(4000, 257, rate)
+    const lpfFreq = createSincFilter(50, 513, rate)
 
     // Create analytic signal from birdsong
     const realPart = new Float32Array(input)
@@ -190,7 +184,7 @@ export function BlackbirdConverter() {
       fmDemod[i] = Math.atan2(cross, dot)
     }
     fmDemod[0] = fmDemod[1]
-    
+
     // Median filter to remove frequency estimation spikes
     const medianFiltered = new Float32Array(length)
     const windowSize = 5
@@ -204,8 +198,8 @@ export function BlackbirdConverter() {
       medianSamples.sort((a, b) => a - b)
       medianFiltered[i] = medianSamples[halfWindow]
     }
-    
-    // Smooth frequency to reduce noise while preserving speech variations
+
+    // Smooth frequency to reduce noise
     const fmFiltered = convolve(medianFiltered, lpfFreq)
 
     // AM demodulation: extract envelope (original voice amplitude)
@@ -217,55 +211,41 @@ export function BlackbirdConverter() {
 
     // Decoding: Reverse the frequency scaling used in encoding
     // Encoding: phase += (fm * 2π/rate) * FSCALE, output = sin(phase * 6)
-    // So birdsong inst_freq = fm_original * FSCALE * 6 (in radians/sample after atan2)
-    // To recover: voice_phase_increment = birdsong_inst_freq / (6 * FSCALE)
-    
+    // Birdsong inst_freq from atan2 ≈ 6 * (fm * 2π/rate) * FSCALE
+    // To recover voice: voice_phase_incr = birdsong_freq / (6 * FSCALE)
+
     const output = new Float32Array(length)
     let phase = 0
-    
-    // Harmonic amplitudes for glottal pulse approximation (decreasing ~6dB/octave)
-    const harmonicAmps = [1.0, 0.7, 0.5, 0.35, 0.25, 0.18, 0.12, 0.08]
-    const harmonicNorm = harmonicAmps.reduce((sum, amp) => sum + amp, 0)
-    
-    // Pitch scaling factor: compensates for the encoding's narrow-band modulation extraction
-    // Encoder uses 70-140Hz bandwidth, we scale to audible voice pitch range (80-400Hz)
-    const PITCH_SCALE = 1.5
-    
-    for (let i = 0; i < length; i++) {
-      // Reverse the scaling to recover original voice frequency variations
-      // fmFiltered[i] is in radians/sample, representing birdsong frequency
-      const voicePhaseIncrement = fmFiltered[i] / (6 * FSCALE)
-      
-      // Scale up the phase increment to audible voice frequency range
-      const scaledIncrement = voicePhaseIncrement * rate * PITCH_SCALE
-      phase += scaledIncrement
-      
-      // Generate glottal-like pulse with rich harmonics for natural voice timbre
-      let wave = 0
-      for (let h = 0; h < harmonicAmps.length; h++) {
-        wave += Math.sin((h + 1) * phase) * harmonicAmps[h]
-      }
-      wave /= harmonicNorm
-      
-      output[i] = wave * amFiltered[i]
-    }
 
-    // Apply voice frequency filter
-    const smoothed = convolve(output, lpfVoice)
+    for (let i = 0; i < length; i++) {
+      // Reverse the scaling: divide by (6 * FSCALE)
+      // fmFiltered[i] is already in radians/sample from atan2
+      const voicePhaseIncrement = fmFiltered[i] / (6 * FSCALE)
+      phase += voicePhaseIncrement
+
+      // Generate voice with fundamental + harmonics for natural timbre
+      const f0 = phase
+      output[i] = (
+        Math.sin(f0) * 1.0 +
+        Math.sin(2 * f0) * 0.5 +
+        Math.sin(3 * f0) * 0.25 +
+        Math.sin(4 * f0) * 0.125
+      ) * amFiltered[i] * 0.4
+    }
 
     // Normalize output
     let maxAbs = 0
     for (let i = 0; i < length; i++) {
-      const abs = Math.abs(smoothed[i])
+      const abs = Math.abs(output[i])
       if (abs > maxAbs) maxAbs = abs
     }
     if (maxAbs > 0) {
-      for (let i = 0; i < length; i++) smoothed[i] *= 0.9 / maxAbs
+      for (let i = 0; i < length; i++) output[i] *= 0.9 / maxAbs
     }
 
     const ctx = audioContextRef.current!
     const outputBuffer = ctx.createBuffer(1, length, rate)
-    outputBuffer.getChannelData(0).set(smoothed)
+    outputBuffer.getChannelData(0).set(output)
     return outputBuffer
   }
 
