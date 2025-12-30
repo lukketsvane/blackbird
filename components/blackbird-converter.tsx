@@ -157,25 +157,12 @@ export function BlackbirdConverter() {
       for (let i = 0; i < length; i++) birdsong[i] *= 0.9 / maxBird
     }
 
-    // Normalize original voice for hidden embedding at inaudible level
-    const HIDDEN_AMPLITUDE = 0.001 // -60dB, inaudible but reconstructable
-    const hiddenVoice = new Float32Array(length)
-    let maxVoice = 0
-    for (let i = 0; i < length; i++) {
-      const abs = Math.abs(input[i])
-      if (abs > maxVoice) maxVoice = abs
-    }
-    if (maxVoice > 0) {
-      for (let i = 0; i < length; i++) hiddenVoice[i] = input[i] * HIDDEN_AMPLITUDE / maxVoice
-    } else {
-      for (let i = 0; i < length; i++) hiddenVoice[i] = input[i] * HIDDEN_AMPLITUDE
-    }
-
-    // Create stereo buffer: Left = birdsong, Right = hidden original voice (inaudible)
+    // Output ONLY the birdsong as mono - speech is encoded in the birdsong itself
+    // The original speech is hidden in the frequency modulation and amplitude modulation
+    // and can only be recovered by the decoder
     const ctx = audioContextRef.current!
-    const outputBuffer = ctx.createBuffer(2, length, rate)
+    const outputBuffer = ctx.createBuffer(1, length, rate)
     outputBuffer.getChannelData(0).set(birdsong)
-    outputBuffer.getChannelData(1).set(hiddenVoice)
     return outputBuffer
   }
 
@@ -183,45 +170,8 @@ export function BlackbirdConverter() {
     const length = audioBuffer.length
     const rate = audioBuffer.sampleRate
     const ctx = audioContextRef.current!
-    
-    // Check if this is a stereo file with hidden embedded original voice
-    if (audioBuffer.numberOfChannels >= 2) {
-      const rightChannel = audioBuffer.getChannelData(1)
-      
-      // Check if right channel has any audio (even at very low amplitude)
-      let rightEnergy = 0
-      for (let i = 0; i < Math.min(length, 44100); i++) {
-        rightEnergy += rightChannel[i] * rightChannel[i]
-      }
-      rightEnergy /= Math.min(length, 44100)
-      
-      // Lower threshold to detect hidden audio (embedded at ~0.001 amplitude)
-      if (rightEnergy > 0.0000001) {
-        // Find max amplitude and normalize to audible level
-        let maxAmp = 0
-        for (let i = 0; i < length; i++) {
-          const abs = Math.abs(rightChannel[i])
-          if (abs > maxAmp) maxAmp = abs
-        }
-        
-        const outputBuffer = ctx.createBuffer(1, length, rate)
-        const outputData = outputBuffer.getChannelData(0)
-        
-        // Amplify the hidden voice back to audible level (0.9 peak)
-        if (maxAmp > 0) {
-          const gain = 0.9 / maxAmp
-          for (let i = 0; i < length; i++) {
-            outputData[i] = rightChannel[i] * gain
-          }
-        } else {
-          outputData.set(rightChannel)
-        }
-        
-        return outputBuffer
-      }
-    }
-    
-    // Fallback for mono files
+
+    // Always decode from the birdsong - speech is encoded in frequency/amplitude modulation
     const input = audioBuffer.getChannelData(0)
 
     const hilbert = createHilbertFilter(129)
@@ -518,13 +468,10 @@ export function BlackbirdConverter() {
         setProcessedBuffer(birdBuffer)
         setMode("encode")
 
-        // Create mono buffer from left channel (birdsong only) for playback
-        const monoPlayback = audioContextRef.current!.createBuffer(1, birdBuffer.length, birdBuffer.sampleRate)
-        monoPlayback.getChannelData(0).set(birdBuffer.getChannelData(0))
-
+        // Birdsong is already mono, play it directly
         setState("playing")
         const source = audioContextRef.current!.createBufferSource()
-        source.buffer = monoPlayback
+        source.buffer = birdBuffer
         source.connect(audioContextRef.current!.destination)
         sourceRef.current = source
         source.onended = () => {
